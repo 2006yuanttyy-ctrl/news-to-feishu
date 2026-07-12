@@ -1,0 +1,39 @@
+name: 财联社与头条新闻推送飞书
+
+on:
+  schedule:
+    # 每 5 分钟运行一次（UTC 时间，cron 不支持时区，5分钟一次足够及时）
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}  # 允许你在 GitHub 网页上手动点一下立即运行，方便测试
+
+# 允许工作流把 seen.json 的更新提交回仓库
+permissions:
+  contents: write
+
+jobs:
+  push-news:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 拉取仓库代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: pip install requests feedparser
+
+      - name: 运行抓取推送脚本
+        env:
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+        run: python fetch_and_push.py
+
+      - name: 保存已推送记录（避免重复推送）
+        run: |
+          git config user.name "news-bot"
+          git config user.email "news-bot@users.noreply.github.com"
+          git add seen.json || true
+          git diff --cached --quiet || git commit -m "更新已推送记录 [skip ci]"
+          git push || true
