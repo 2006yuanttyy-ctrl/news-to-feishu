@@ -30,8 +30,6 @@ RSSHUB_MIRRORS = [
 
 # 各来源的路径（不含域名，域名从上面镜像列表里轮流拼接）
 CLS_RED_PATH = "/cls/telegraph/red"       # 财联社 - 电报（加红/重要消息）
-CLS_ALL_PATH = "/cls/telegraph"           # 财联社 - 电报（全部消息）
-HEADLINE_PATH = "/baidu/top"              # 百度热搜榜（泛指各大门户重大新闻/头条）
 
 # 每类消息单次最多推送几条，防止第一次运行时刷屏
 MAX_PUSH_PER_SOURCE = 8
@@ -176,8 +174,6 @@ def main():
     seen = load_seen()
 
     process_source(CLS_RED_PATH, seen, "cls_red", "🔴 财联社重要电报", is_important=True)
-    process_source(CLS_ALL_PATH, seen, "cls_all", "📈 财联社电报")
-    process_source(HEADLINE_PATH, seen, "headline", "📰 头条要闻（百度热搜）")
 
     save_seen(seen)
 
