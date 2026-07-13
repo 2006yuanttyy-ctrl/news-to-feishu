@@ -12,10 +12,12 @@
 
 import json
 import os
+import re
 import sys
 import time
 import requests
 import feedparser
+from difflib import SequenceMatcher
 
 # ========== 配置区（一般不用改） ==========
 
@@ -30,9 +32,16 @@ RSSHUB_MIRRORS = [
 
 # 各来源的路径（不含域名，域名从上面镜像列表里轮流拼接）
 CLS_RED_PATH = "/cls/telegraph/red"       # 财联社 - 电报（加红/重要消息）
+WALLSTREETCN_PATH = "/wallstreetcn/live"  # 华尔街见闻 - 实时快讯（政策/监管类新闻常最先报）
+JIN10_PATH = "/jin10/important"           # 金十数据 - 重要资讯（国际财经/汇率/大宗商品反应快）
 
 # 每类消息单次最多推送几条，防止第一次运行时刷屏
 MAX_PUSH_PER_SOURCE = 8
+
+# 跨来源去重：如果新消息标题跟"最近一段时间内已经推送过的标题"很相似，
+# 就认为是同一件事被不同来源重复报道，不再重复推送
+DEDUP_SIMILARITY_THRESHOLD = 0.55   # 相似度阈值，0~1，越大越"宽松"（判定重复的门槛更高）
+DEDUP_WINDOW_SECONDS = 3 * 60 * 60  # 只跟最近 3 小时内推送过的标题比较，超过这个时间不再比对
 
 # 已推送记录文件
 SEEN_FILE = "seen.json"
@@ -48,6 +57,42 @@ HEADERS = {
     ),
     "Accept": "application/rss+xml, application/xml, text/xml, */*",
 }
+
+
+def normalize_title(title):
+    """把标题里的日期、时间、来源名等"干扰项"去掉，方便比较是不是同一件事"""
+    t = title.strip()
+    # 去掉开头的日期/时间，比如 "7月13日，" "14:32，"
+    t = re.sub(r"^[\d]{1,2}[月/-][\d]{1,2}[日]?[，,：:\s]*", "", t)
+    t = re.sub(r"^[\d]{1,2}[:：][\d]{1,2}[，,：:\s]*", "", t)
+    # 去掉常见的媒体自称前缀
+    t = re.sub(r"^(财联社|华尔街见闻|金十数据|消息|快讯|据悉|据报道)[，,：:\s]*", "", t)
+    # 去掉标点符号，只留中英文和数字
+    t = re.sub(r"[^\w\u4e00-\u9fa5]", "", t)
+    return t
+
+
+def is_duplicate_across_sources(title, recent_titles):
+    """判断这条标题，是不是跟"最近推送过的标题"讲的是同一件事"""
+    norm = normalize_title(title)
+    if not norm:
+        return False
+    now = time.time()
+    for item in recent_titles:
+        if now - item.get("ts", 0) > DEDUP_WINDOW_SECONDS:
+            continue
+        other = item.get("norm", "")
+        if not other:
+            continue
+        # 一个标题的核心内容完全包含在另一个里面，直接判定重复
+        short, long_ = (norm, other) if len(norm) <= len(other) else (other, norm)
+        if len(short) >= 8 and short in long_:
+            return True
+        # 否则用整体相似度打分
+        ratio = SequenceMatcher(None, norm, other).ratio()
+        if ratio >= DEDUP_SIMILARITY_THRESHOLD:
+            return True
+    return False
 
 
 def load_seen():
@@ -149,31 +194,63 @@ def process_source(path, seen, source_key, label, is_important=False):
         return
 
     seen_ids = set(seen.get(source_key, []))
+    recent_titles = seen.setdefault("_recent_titles", [])
+
     new_entries = [e for e in entries if e[0] not in seen_ids]
 
-    # 首次运行（seen_ids 为空）时不刷屏，只记录不推送
+    # 首次运行（seen_ids 为空）时不刷屏，只记录不推送，但要把标题存进"最近标题池"，
+    # 这样下一次真正开始推送时，不会因为看不到这些历史标题而误判重复
     first_run = len(seen_ids) == 0
 
-    to_push = new_entries[-MAX_PUSH_PER_SOURCE:] if new_entries else []
+    to_consider = new_entries[-MAX_PUSH_PER_SOURCE:] if new_entries else []
+
+    pushed_count = 0
+    skipped_dup_count = 0
 
     for entry_id, title, link, ts in new_entries:
         seen_ids.add(entry_id)
 
     if not first_run:
-        for entry_id, title, link, ts in to_push:
+        for entry_id, title, link, ts in to_consider:
+            if is_duplicate_across_sources(title, recent_titles):
+                skipped_dup_count += 1
+                print(f"  跳过（跟其他来源重复）：{title}")
+                continue
             text = f"{label}\n{title}\n{link}" if link else f"{label}\n{title}"
             send_to_feishu(text, is_important=is_important)
+            pushed_count += 1
+            recent_titles.append({
+                "norm": normalize_title(title),
+                "ts": time.time(),
+                "source": source_key,
+            })
+        print(f"{label}：本次推送 {pushed_count} 条，因跨源重复跳过 {skipped_dup_count} 条")
     else:
+        # 首次运行：把已有标题也记进"最近标题池"，作为去重的起点
+        for entry_id, title, link, ts in new_entries[-MAX_PUSH_PER_SOURCE:]:
+            recent_titles.append({
+                "norm": normalize_title(title),
+                "ts": time.time(),
+                "source": source_key,
+            })
         print(f"{label} 首次运行，记录 {len(new_entries)} 条历史消息，不推送")
 
-    # 只保留最近 500 条，防止文件无限增大
+    # 只保留最近 500 条 id，防止文件无限增大
     seen[source_key] = list(seen_ids)[-500:]
+
+    # 清理"最近标题池"：只留 DEDUP_WINDOW_SECONDS 时间窗口内的，避免文件越滚越大
+    now = time.time()
+    seen["_recent_titles"] = [
+        item for item in recent_titles if now - item.get("ts", 0) <= DEDUP_WINDOW_SECONDS
+    ][-300:]
 
 
 def main():
     seen = load_seen()
 
     process_source(CLS_RED_PATH, seen, "cls_red", "🔴 财联社重要电报", is_important=True)
+    process_source(WALLSTREETCN_PATH, seen, "wallstreetcn", "🟠 华尔街见闻快讯", is_important=True)
+    process_source(JIN10_PATH, seen, "jin10", "🌍 金十数据重要资讯", is_important=True)
 
     save_seen(seen)
 
