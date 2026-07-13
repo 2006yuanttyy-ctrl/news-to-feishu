@@ -19,12 +19,19 @@ import feedparser
 
 # ========== 配置区（一般不用改） ==========
 
-# 财联社 - 电报（加红/重要消息）
-CLS_RED_URL = "https://rsshub.app/cls/telegraph/red"
-# 财联社 - 电报（全部消息，如果只想要重要消息，可以把下面这行注释掉）
-CLS_ALL_URL = "https://rsshub.app/cls/telegraph"
-# 百度热搜榜（泛指各大门户重大新闻/头条）
-HEADLINE_URL = "https://rsshub.app/baidu/top"
+# RSSHub 公共镜像列表：第一个抓不到就依次尝试下一个，提高成功率
+RSSHUB_MIRRORS = [
+    "https://rsshub.app",
+    "https://rsshub.rssforever.com",
+    "https://rsshub.pseudoyu.com",
+    "https://rsshub.liumingye.cn",
+    "https://rsshub.agrreader.com",
+]
+
+# 各来源的路径（不含域名，域名从上面镜像列表里轮流拼接）
+CLS_RED_PATH = "/cls/telegraph/red"       # 财联社 - 电报（加红/重要消息）
+CLS_ALL_PATH = "/cls/telegraph"           # 财联社 - 电报（全部消息）
+HEADLINE_PATH = "/baidu/top"              # 百度热搜榜（泛指各大门户重大新闻/头条）
 
 # 每类消息单次最多推送几条，防止第一次运行时刷屏
 MAX_PUSH_PER_SOURCE = 8
@@ -34,6 +41,15 @@ SEEN_FILE = "seen.json"
 
 # 飞书 Webhook 地址，从 GitHub Secrets 里读取，不要把地址写死在代码里
 FEISHU_WEBHOOK = os.environ.get("FEISHU_WEBHOOK", "").strip()
+
+# 伪装成正常浏览器的请求头，避免被 RSSHub / 上游网站当成机器人拦截
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/rss+xml, application/xml, text/xml, */*",
+}
 
 
 def load_seen():
@@ -51,21 +67,42 @@ def save_seen(seen):
         json.dump(seen, f, ensure_ascii=False, indent=2)
 
 
-def fetch_entries(url):
-    """抓取 RSS，返回 [(id, title, link, published_ts), ...]，按时间从旧到新排列"""
-    feed = feedparser.parse(url)
-    entries = []
-    for e in feed.entries:
-        entry_id = e.get("id") or e.get("link") or e.get("title")
-        title = e.get("title", "").strip()
-        link = e.get("link", "")
-        # 有些源用 published_parsed，有些用 updated_parsed
-        t = e.get("published_parsed") or e.get("updated_parsed")
-        ts = time.mktime(t) if t else time.time()
-        entries.append((entry_id, title, link, ts))
-    # 按时间正序，保证先推早的消息，后推最新的
-    entries.sort(key=lambda x: x[3])
-    return entries
+def fetch_entries(path):
+    """依次尝试各个 RSSHub 镜像抓取 path 对应的 RSS，
+    返回 [(id, title, link, published_ts), ...]，按时间从旧到新排列。
+    任何一个镜像成功拿到内容就立即返回，不再继续尝试。
+    """
+    last_error = None
+    for base in RSSHUB_MIRRORS:
+        url = base.rstrip("/") + path
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=15)
+            print(f"  尝试镜像 {base} → HTTP {resp.status_code}，返回长度 {len(resp.text)}")
+            if resp.status_code != 200 or len(resp.text) < 100:
+                last_error = f"HTTP {resp.status_code}"
+                continue
+            feed = feedparser.parse(resp.text)
+            if not feed.entries:
+                last_error = "解析出 0 条 entries"
+                continue
+
+            entries = []
+            for e in feed.entries:
+                entry_id = e.get("id") or e.get("link") or e.get("title")
+                title = e.get("title", "").strip()
+                link = e.get("link", "")
+                t = e.get("published_parsed") or e.get("updated_parsed")
+                ts = time.mktime(t) if t else time.time()
+                entries.append((entry_id, title, link, ts))
+            entries.sort(key=lambda x: x[3])
+            print(f"  ✔ 从 {base} 成功抓到 {len(entries)} 条")
+            return entries
+        except Exception as ex:
+            last_error = str(ex)
+            print(f"  镜像 {base} 抓取出错：{ex}")
+            continue
+
+    raise RuntimeError(f"所有镜像均抓取失败，最后一次错误：{last_error}")
 
 
 def send_to_feishu(text, is_important=False):
@@ -103,11 +140,12 @@ def send_to_feishu(text, is_important=False):
     time.sleep(0.3)
 
 
-def process_source(url, seen, source_key, label, is_important=False):
-    if not url:
+def process_source(path, seen, source_key, label, is_important=False):
+    if not path:
         return
+    print(f"开始抓取：{label}")
     try:
-        entries = fetch_entries(url)
+        entries = fetch_entries(path)
     except Exception as ex:
         print(f"抓取 {label} 失败：{ex}")
         return
@@ -137,9 +175,9 @@ def process_source(url, seen, source_key, label, is_important=False):
 def main():
     seen = load_seen()
 
-    process_source(CLS_RED_URL, seen, "cls_red", "🔴 财联社重要电报", is_important=True)
-    process_source(CLS_ALL_URL, seen, "cls_all", "📈 财联社电报")
-    process_source(HEADLINE_URL, seen, "headline", "📰 头条要闻（百度热搜）")
+    process_source(CLS_RED_PATH, seen, "cls_red", "🔴 财联社重要电报", is_important=True)
+    process_source(CLS_ALL_PATH, seen, "cls_all", "📈 财联社电报")
+    process_source(HEADLINE_PATH, seen, "headline", "📰 头条要闻（百度热搜）")
 
     save_seen(seen)
 
