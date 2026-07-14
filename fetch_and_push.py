@@ -59,6 +59,55 @@ HEADERS = {
 }
 
 
+# 战争/军事/地缘政治关键词
+WAR_KEYWORDS = [
+    "战争","军事","袭击","空袭","导弹","无人机","轰炸","核武","核设施",
+    "军演","冲突","停火","火箭弹","美国","美军","五角大楼","伊朗","以色列",
+    "俄罗斯","俄军","乌克兰","乌军","北约","胡塞","哈马斯","真主党",
+    "中东局势","国防部","国防军","参谋长","革命卫队","航母","驱逐舰",
+    "战机","F35","F-35","B2","B-2","爱国者","萨德","红海",
+    "霍尔木兹","波斯湾","制裁","军火","武器援助","撤侨","戒严","紧急状态",
+]
+
+
+
+COMMODITY_KEYWORDS = [
+    "黄金","白银","现货黄金","现货白银","COMEX黄金","COMEX白银",
+    "伦敦金","伦敦银","贵金属","有色金属","铜","沪铜","伦铜",
+    "铝","氧化铝","锌","铅","镍","锡","工业硅","稀土",
+    "碳酸锂","锂矿","锂盐","锂电原料","铁矿石",
+    "焦煤","焦炭","原油","布伦特原油","WTI原油",
+    "天然气","LNG","期货","商品期货"
+]
+
+
+AI_KEYWORDS = [
+    "人工智能","AI","大模型","算力","AIGC","机器人","人形机器人",
+    "智谱","DeepSeek","OpenAI","英伟达","GPU","数据中心","CPO"
+]
+
+SEMICONDUCTOR_KEYWORDS = [
+    "半导体","芯片","晶圆","光刻机","EDA","存储芯片","HBM",
+    "先进封装","台积电","中芯国际","集成电路"
+]
+
+POLICY_KEYWORDS = [
+    "国务院","国常会","证监会","央行","金融监管总局",
+    "降准","降息","货币政策","财政政策","专项债","政治局会议"
+]
+
+def is_ai_news(title, summary=""):
+    text = f"{title} {summary}".lower()
+    return any(k.lower() in text for k in AI_KEYWORDS)
+
+def is_semiconductor_news(title, summary=""):
+    text = f"{title} {summary}".lower()
+    return any(k.lower() in text for k in SEMICONDUCTOR_KEYWORDS)
+
+def is_policy_news(title, summary=""):
+    text = f"{title} {summary}".lower()
+    return any(k.lower() in text for k in POLICY_KEYWORDS)
+
 def normalize_title(title):
     """把标题里的日期、时间、来源名等"干扰项"去掉，方便比较是不是同一件事"""
     t = title.strip()
@@ -70,6 +119,24 @@ def normalize_title(title):
     # 去掉标点符号，只留中英文和数字
     t = re.sub(r"[^\w\u4e00-\u9fa5]", "", t)
     return t
+
+
+
+def is_commodity_news(title, summary=""):
+    text = f"{title} {summary}".lower()
+    for kw in COMMODITY_KEYWORDS:
+        if kw.lower() in text:
+            return True
+    return False
+
+
+def is_war_news(title, summary=""):
+    """标题+正文联合判断战争新闻"""
+    text = f"{title} {summary}".lower()
+    for kw in WAR_KEYWORDS:
+        if kw.lower() in text:
+            return True
+    return False
 
 
 def is_duplicate_across_sources(title, recent_titles):
@@ -134,9 +201,11 @@ def fetch_entries(path):
                 entry_id = e.get("id") or e.get("link") or e.get("title")
                 title = e.get("title", "").strip()
                 link = e.get("link", "")
+                summary = (e.get("summary", "") or e.get("description", "") or "")
+                summary = re.sub(r"<[^>]+>", "", summary).strip()
                 t = e.get("published_parsed") or e.get("updated_parsed")
                 ts = time.mktime(t) if t else time.time()
-                entries.append((entry_id, title, link, ts))
+                entries.append((entry_id, title, summary, link, ts))
             entries.sort(key=lambda x: x[3])
             print(f"  ✔ 从 {base} 成功抓到 {len(entries)} 条")
             return entries
@@ -148,7 +217,7 @@ def fetch_entries(path):
     raise RuntimeError(f"所有镜像均抓取失败，最后一次错误：{last_error}")
 
 
-def send_to_feishu(text, is_important=False):
+def send_to_feishu(text, is_important=False, is_war=False, is_commodity=False, is_ai=False, is_semiconductor=False, is_policy=False):
     if not FEISHU_WEBHOOK:
         print("未配置 FEISHU_WEBHOOK，跳过推送，仅打印：")
         print(text)
@@ -160,8 +229,8 @@ def send_to_feishu(text, is_important=False):
             "msg_type": "interactive",
             "card": {
                 "header": {
-                    "title": {"tag": "plain_text", "content": "🔴 财联社重要电报"},
-                    "template": "red",
+                    "title": {"tag": "plain_text", "content": ("🟢 AI算力机器人快讯" if is_ai else ("🟣 半导体芯片快讯" if is_semiconductor else ("🔵 商品期货快讯" if is_commodity else ("🟡 战争地缘政治快讯" if is_war else ("🟥 重要政策快讯" if is_policy else "🔴 财联社重要电报")))))},
+                    "template": ("green" if is_ai else ("purple" if is_semiconductor else ("blue" if is_commodity else ("yellow" if is_war else ("red" if is_policy else "red"))))),
                 },
                 "elements": [
                     {"tag": "div", "text": {"tag": "lark_md", "content": text}},
@@ -207,17 +276,31 @@ def process_source(path, seen, source_key, label, is_important=False):
     pushed_count = 0
     skipped_dup_count = 0
 
-    for entry_id, title, link, ts in new_entries:
+    for entry_id, title, summary, link, ts in new_entries:
         seen_ids.add(entry_id)
 
     if not first_run:
-        for entry_id, title, link, ts in to_consider:
+        for entry_id, title, summary, link, ts in to_consider:
             if is_duplicate_across_sources(title, recent_titles):
                 skipped_dup_count += 1
                 print(f"  跳过（跟其他来源重复）：{title}")
                 continue
-            text = f"{label}\n{title}\n{link}" if link else f"{label}\n{title}"
-            send_to_feishu(text, is_important=is_important)
+            preview = summary[:120] if summary else ""
+            text = f"{label}\n\n{title}\n\n{preview}\n\n{link}" if link else f"{label}\n\n{title}\n\n{preview}"
+            war_flag = is_war_news(title, summary)
+            commodity_flag = is_commodity_news(title, summary)
+            ai_flag = is_ai_news(title, summary)
+            semiconductor_flag = is_semiconductor_news(title, summary)
+            policy_flag = is_policy_news(title, summary)
+            send_to_feishu(
+                text,
+                is_important=is_important,
+                is_war=war_flag,
+                is_commodity=commodity_flag,
+                is_ai=ai_flag,
+                is_semiconductor=semiconductor_flag,
+                is_policy=policy_flag
+            )
             pushed_count += 1
             recent_titles.append({
                 "norm": normalize_title(title),
@@ -227,7 +310,7 @@ def process_source(path, seen, source_key, label, is_important=False):
         print(f"{label}：本次推送 {pushed_count} 条，因跨源重复跳过 {skipped_dup_count} 条")
     else:
         # 首次运行：把已有标题也记进"最近标题池"，作为去重的起点
-        for entry_id, title, link, ts in new_entries[-MAX_PUSH_PER_SOURCE:]:
+        for entry_id, title, summary, link, ts in new_entries[-MAX_PUSH_PER_SOURCE:]:
             recent_titles.append({
                 "norm": normalize_title(title),
                 "ts": time.time(),
@@ -257,3 +340,36 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ================= V4 板块映射增强 =================
+
+SECTOR_KEYWORDS = {
+    "机器人": ["机器人","人形机器人","工业机器人"],
+    "AI算力": ["AI","人工智能","算力","GPU","数据中心","大模型"],
+    "半导体": ["半导体","芯片","晶圆","光刻机","HBM"],
+    "军工": ["军工","导弹","战机","航母","国防"],
+    "创新药": ["创新药","CXO","ADC","减肥药","PD-1"],
+    "新能源": ["碳酸锂","锂矿","储能","光伏","风电"],
+    "黄金有色": ["黄金","白银","铜","铝","镍","稀土"],
+}
+
+def detect_sectors(title, summary=""):
+    text = f"{title} {summary}".lower()
+    sectors = []
+    for sector, kws in SECTOR_KEYWORDS.items():
+        if any(k.lower() in text for k in kws):
+            sectors.append(sector)
+    return sectors
+
+def sentiment_hint(title, summary=""):
+    text = f"{title} {summary}"
+    positive = ["突破","增长","扩大","签约","利好","创新高","上调","增持"]
+    negative = ["下滑","制裁","下调","减持","亏损","调查","处罚"]
+    p = sum(1 for x in positive if x in text)
+    n = sum(1 for x in negative if x in text)
+    if p > n:
+        return "利好"
+    if n > p:
+        return "利空"
+    return "中性"
