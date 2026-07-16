@@ -1,19 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-自动抓取「财联社电报（重要/普通）」和「百度热搜（泛指头条新闻）」
-新内容推送到飞书群机器人。重要消息（财联社加红）用红色卡片 + @所有人 强提醒。
+自动抓取「财联社电报（重要）」「华尔街见闻实时快讯」「金十数据重要资讯」，
+新内容按类别分组、汇总推送到飞书群机器人。
 
-原理：
-1. 通过 RSSHub 公共实例把财联社电报、百度热搜转换成 RSS
-2. 用 seen.json 记录已经推送过的内容 id，避免重复推送
-3. 新内容通过飞书自定义机器人 Webhook 推送出去
-4. GitHub Actions 会定时（默认每 5 分钟）运行本脚本一次
+V5 相比 V4 的核心变化：
+1. 不再是抓到一条就发一张卡片 —— 所有来源、所有新条目先收集起来，
+   最后按"战争地缘 / 政策监管 / AI算力 / 半导体 / 商品期货 / 其他"分类分组，
+   一次运行最多只发 1~2 张汇总卡片，避免刷屏、看不过来。
+2. 标题本身就是链接（点标题看详情），不再单独占一行放预览文字和链接，
+   大幅减少每条消息占用的行数和间距。
+3. 只有"战争地缘""政策监管"这两类才 @所有人，其余分类只是分组展示，
+   不再每条都强提醒。
 """
 
 import json
 import os
 import re
-import sys
 import time
 import requests
 import feedparser
@@ -31,25 +33,32 @@ RSSHUB_MIRRORS = [
 ]
 
 # 各来源的路径（不含域名，域名从上面镜像列表里轮流拼接）
-CLS_RED_PATH = "/cls/telegraph/red"       # 财联社 - 电报（加红/重要消息）
-WALLSTREETCN_PATH = "/wallstreetcn/live"  # 华尔街见闻 - 实时快讯（政策/监管类新闻常最先报）
-JIN10_PATH = "/jin10/important"           # 金十数据 - 重要资讯（国际财经/汇率/大宗商品反应快）
+SOURCES = [
+    # (path, source_key, 来源短标签)
+    ("/cls/telegraph/red", "cls_red", "财联社"),
+    ("/wallstreetcn/live", "wallstreetcn", "华尔街见闻"),
+    ("/jin10/important", "jin10", "金十数据"),
+]
 
-# 每类消息单次最多推送几条，防止第一次运行时刷屏
+# 每类消息单次最多考虑几条新的（防止第一次运行或长时间没跑时刷屏）
 MAX_PUSH_PER_SOURCE = 8
 
 # 跨来源去重：如果新消息标题跟"最近一段时间内已经推送过的标题"很相似，
 # 就认为是同一件事被不同来源重复报道，不再重复推送
-DEDUP_SIMILARITY_THRESHOLD = 0.55   # 相似度阈值，0~1，越大越"宽松"（判定重复的门槛更高）
-DEDUP_WINDOW_SECONDS = 3 * 60 * 60  # 只跟最近 3 小时内推送过的标题比较，超过这个时间不再比对
+DEDUP_SIMILARITY_THRESHOLD = 0.55   # 相似度阈值，0~1，越大越"宽松"
+DEDUP_WINDOW_SECONDS = 3 * 60 * 60  # 只跟最近 3 小时内推送过的标题比较
+
+# 一张卡片最多放几条，超过就拆到下一张卡片
+MAX_ITEMS_PER_CARD = 20
+# 一次运行最多发几张卡片；超出的条目只在卡片末尾提示条数，不再单独发卡片
+MAX_CARDS_PER_RUN = 2
 
 # 已推送记录文件
 SEEN_FILE = "seen.json"
 
-# 飞书 Webhook 地址，从 GitHub Secrets 里读取，不要把地址写死在代码里
+# 飞书 Webhook 地址，从 GitHub Secrets 里读取
 FEISHU_WEBHOOK = os.environ.get("FEISHU_WEBHOOK", "").strip()
 
-# 伪装成正常浏览器的请求头，避免被 RSSHub / 上游网站当成机器人拦截
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -58,85 +67,89 @@ HEADERS = {
     "Accept": "application/rss+xml, application/xml, text/xml, */*",
 }
 
-
-# 战争/军事/地缘政治关键词
-WAR_KEYWORDS = [
-    "战争","军事","袭击","空袭","导弹","无人机","轰炸","核武","核设施",
-    "军演","冲突","停火","火箭弹","美国","美军","五角大楼","伊朗","以色列",
-    "俄罗斯","俄军","乌克兰","乌军","北约","胡塞","哈马斯","真主党",
-    "中东局势","国防部","国防军","参谋长","革命卫队","航母","驱逐舰",
-    "战机","F35","F-35","B2","B-2","爱国者","萨德","红海",
-    "霍尔木兹","波斯湾","制裁","军火","武器援助","撤侨","戒严","紧急状态",
+# ========== 分类关键词（按优先级从高到低，命中第一个匹配的类别就归为该类） ==========
+# 每一项：(分类key, 展示用的分类标签, 关键词列表)
+CATEGORY_DEFS = [
+    ("war", "🟡 战争地缘", [
+        "战争", "军事", "袭击", "空袭", "导弹", "无人机", "轰炸", "核武", "核设施",
+        "军演", "冲突", "停火", "火箭弹", "美军", "五角大楼", "伊朗", "以色列",
+        "俄罗斯", "俄军", "乌克兰", "乌军", "北约", "胡塞", "哈马斯", "真主党",
+        "中东局势", "国防部", "国防军", "参谋长", "革命卫队", "航母", "驱逐舰",
+        "战机", "F35", "F-35", "B2", "B-2", "爱国者", "萨德", "红海",
+        "霍尔木兹", "波斯湾", "军火", "武器援助", "撤侨", "戒严", "紧急状态",
+    ]),
+    ("policy", "🟥 政策监管", [
+        "国务院", "国常会", "证监会", "央行", "金融监管总局", "制裁",
+        "降准", "降息", "货币政策", "财政政策", "专项债", "政治局会议",
+    ]),
+    ("ai", "🟢 AI算力机器人", [
+        "人工智能", "AI", "大模型", "算力", "AIGC", "机器人", "人形机器人",
+        "智谱", "DeepSeek", "OpenAI", "英伟达", "GPU", "数据中心", "CPO",
+    ]),
+    ("semiconductor", "🟣 半导体芯片", [
+        "半导体", "芯片", "晶圆", "光刻机", "EDA", "存储芯片", "HBM",
+        "先进封装", "台积电", "中芯国际", "集成电路",
+    ]),
+    ("commodity", "🔵 商品期货贵金属", [
+        "黄金", "白银", "现货黄金", "现货白银", "COMEX黄金", "COMEX白银",
+        "伦敦金", "伦敦银", "贵金属", "有色金属", "铜", "沪铜", "伦铜",
+        "铝", "氧化铝", "锌", "铅", "镍", "锡", "工业硅", "稀土",
+        "碳酸锂", "锂矿", "锂盐", "锂电原料", "铁矿石",
+        "焦煤", "焦炭", "原油", "布伦特原油", "WTI原油",
+        "天然气", "LNG", "期货", "商品期货",
+    ]),
 ]
+# 兜底分类：没命中任何关键词的消息
+DEFAULT_CATEGORY = ("other", "⚪ 其他财经快讯")
+
+# 分类展示顺序（优先级从高到低）
+CATEGORY_ORDER = [k for k, _, _ in CATEGORY_DEFS] + [DEFAULT_CATEGORY[0]]
+
+# 需要 @所有人 强提醒的分类
+ALERT_CATEGORIES = {"war", "policy"}
+
+# 每个分类对应的卡片主题色（Feishu card template 颜色）
+CATEGORY_COLOR = {
+    "war": "yellow",
+    "policy": "red",
+    "ai": "green",
+    "semiconductor": "purple",
+    "commodity": "blue",
+    "other": "grey",
+}
 
 
-
-COMMODITY_KEYWORDS = [
-    "黄金","白银","现货黄金","现货白银","COMEX黄金","COMEX白银",
-    "伦敦金","伦敦银","贵金属","有色金属","铜","沪铜","伦铜",
-    "铝","氧化铝","锌","铅","镍","锡","工业硅","稀土",
-    "碳酸锂","锂矿","锂盐","锂电原料","铁矿石",
-    "焦煤","焦炭","原油","布伦特原油","WTI原油",
-    "天然气","LNG","期货","商品期货"
-]
-
-
-AI_KEYWORDS = [
-    "人工智能","AI","大模型","算力","AIGC","机器人","人形机器人",
-    "智谱","DeepSeek","OpenAI","英伟达","GPU","数据中心","CPO"
-]
-
-SEMICONDUCTOR_KEYWORDS = [
-    "半导体","芯片","晶圆","光刻机","EDA","存储芯片","HBM",
-    "先进封装","台积电","中芯国际","集成电路"
-]
-
-POLICY_KEYWORDS = [
-    "国务院","国常会","证监会","央行","金融监管总局",
-    "降准","降息","货币政策","财政政策","专项债","政治局会议"
-]
-
-def is_ai_news(title, summary=""):
+def categorize(title, summary=""):
+    """返回 (分类key, 分类展示标签)，按 CATEGORY_DEFS 顺序，命中第一个就返回"""
     text = f"{title} {summary}".lower()
-    return any(k.lower() in text for k in AI_KEYWORDS)
+    for key, label, kws in CATEGORY_DEFS:
+        if any(kw.lower() in text for kw in kws):
+            return key, label
+    return DEFAULT_CATEGORY
 
-def is_semiconductor_news(title, summary=""):
-    text = f"{title} {summary}".lower()
-    return any(k.lower() in text for k in SEMICONDUCTOR_KEYWORDS)
 
-def is_policy_news(title, summary=""):
-    text = f"{title} {summary}".lower()
-    return any(k.lower() in text for k in POLICY_KEYWORDS)
+def sentiment_hint(title, summary=""):
+    """粗略判断这条消息偏利好/利空/中性，用于在条目后面加个小标签"""
+    text = f"{title} {summary}"
+    positive = ["突破", "增长", "扩大", "签约", "利好", "创新高", "上调", "增持"]
+    negative = ["下滑", "制裁", "下调", "减持", "亏损", "调查", "处罚"]
+    p = sum(1 for x in positive if x in text)
+    n = sum(1 for x in negative if x in text)
+    if p > n:
+        return "利好"
+    if n > p:
+        return "利空"
+    return "中性"
+
 
 def normalize_title(title):
     """把标题里的日期、时间、来源名等"干扰项"去掉，方便比较是不是同一件事"""
     t = title.strip()
-    # 去掉开头的日期/时间，比如 "7月13日，" "14:32，"
     t = re.sub(r"^[\d]{1,2}[月/-][\d]{1,2}[日]?[，,：:\s]*", "", t)
     t = re.sub(r"^[\d]{1,2}[:：][\d]{1,2}[，,：:\s]*", "", t)
-    # 去掉常见的媒体自称前缀
     t = re.sub(r"^(财联社|华尔街见闻|金十数据|消息|快讯|据悉|据报道)[，,：:\s]*", "", t)
-    # 去掉标点符号，只留中英文和数字
     t = re.sub(r"[^\w\u4e00-\u9fa5]", "", t)
     return t
-
-
-
-def is_commodity_news(title, summary=""):
-    text = f"{title} {summary}".lower()
-    for kw in COMMODITY_KEYWORDS:
-        if kw.lower() in text:
-            return True
-    return False
-
-
-def is_war_news(title, summary=""):
-    """标题+正文联合判断战争新闻"""
-    text = f"{title} {summary}".lower()
-    for kw in WAR_KEYWORDS:
-        if kw.lower() in text:
-            return True
-    return False
 
 
 def is_duplicate_across_sources(title, recent_titles):
@@ -151,11 +164,9 @@ def is_duplicate_across_sources(title, recent_titles):
         other = item.get("norm", "")
         if not other:
             continue
-        # 一个标题的核心内容完全包含在另一个里面，直接判定重复
         short, long_ = (norm, other) if len(norm) <= len(other) else (other, norm)
         if len(short) >= 8 and short in long_:
             return True
-        # 否则用整体相似度打分
         ratio = SequenceMatcher(None, norm, other).ratio()
         if ratio >= DEDUP_SIMILARITY_THRESHOLD:
             return True
@@ -179,8 +190,7 @@ def save_seen(seen):
 
 def fetch_entries(path):
     """依次尝试各个 RSSHub 镜像抓取 path 对应的 RSS，
-    返回 [(id, title, link, published_ts), ...]，按时间从旧到新排列。
-    任何一个镜像成功拿到内容就立即返回，不再继续尝试。
+    返回 [(id, title, summary, link, published_ts), ...]，按时间从旧到新排列。
     """
     last_error = None
     for base in RSSHUB_MIRRORS:
@@ -206,7 +216,7 @@ def fetch_entries(path):
                 t = e.get("published_parsed") or e.get("updated_parsed")
                 ts = time.mktime(t) if t else time.time()
                 entries.append((entry_id, title, summary, link, ts))
-            entries.sort(key=lambda x: x[3])
+            entries.sort(key=lambda x: x[4])
             print(f"  ✔ 从 {base} 成功抓到 {len(entries)} 条")
             return entries
         except Exception as ex:
@@ -217,29 +227,162 @@ def fetch_entries(path):
     raise RuntimeError(f"所有镜像均抓取失败，最后一次错误：{last_error}")
 
 
-def send_to_feishu(text, is_important=False, is_war=False, is_commodity=False, is_ai=False, is_semiconductor=False, is_policy=False):
+def process_source(path, source_key, source_label, seen, collected):
+    """抓取一个来源，把去重后需要推送的条目追加进 collected 列表（不在这里发送）"""
+    print(f"开始抓取：{source_label}")
+    try:
+        entries = fetch_entries(path)
+    except Exception as ex:
+        print(f"抓取 {source_label} 失败：{ex}")
+        return
+
+    seen_ids = set(seen.get(source_key, []))
+    recent_titles = seen.setdefault("_recent_titles", [])
+
+    new_entries = [e for e in entries if e[0] not in seen_ids]
+    first_run = len(seen_ids) == 0
+
+    for entry_id, *_ in new_entries:
+        seen_ids.add(entry_id)
+
+    to_consider = new_entries[-MAX_PUSH_PER_SOURCE:] if new_entries else []
+
+    if first_run:
+        # 首次运行：只记录历史标题作为去重起点，不推送，避免刚上线就刷屏
+        for entry_id, title, summary, link, ts in to_consider:
+            recent_titles.append({
+                "norm": normalize_title(title),
+                "ts": time.time(),
+                "source": source_key,
+            })
+        print(f"{source_label} 首次运行，记录 {len(new_entries)} 条历史消息，不推送")
+    else:
+        skipped_dup = 0
+        for entry_id, title, summary, link, ts in to_consider:
+            if is_duplicate_across_sources(title, recent_titles):
+                skipped_dup += 1
+                print(f"  跳过（跟其他来源重复）：{title}")
+                continue
+            cat_key, cat_label = categorize(title, summary)
+            collected.append({
+                "cat_key": cat_key,
+                "cat_label": cat_label,
+                "title": title,
+                "link": link,
+                "source": source_label,
+                "sentiment": sentiment_hint(title, summary),
+                "ts": ts,
+            })
+            recent_titles.append({
+                "norm": normalize_title(title),
+                "ts": time.time(),
+                "source": source_key,
+            })
+        print(f"{source_label}：本次收集 {len(to_consider) - skipped_dup} 条待推送，因跨源重复跳过 {skipped_dup} 条")
+
+    seen[source_key] = list(seen_ids)[-500:]
+    now = time.time()
+    seen["_recent_titles"] = [
+        item for item in recent_titles if now - item.get("ts", 0) <= DEDUP_WINDOW_SECONDS
+    ][-300:]
+
+
+def build_card_bodies(collected):
+    """
+    把 collected 按分类分组，生成若干张卡片的内容：
+    每张卡片是 (markdown正文, 是否需要@所有人, 主题色) 的元组列表。
+    最多生成 MAX_CARDS_PER_RUN 张，多出的条目在最后一张卡片末尾提示条数。
+    """
+    if not collected:
+        return []
+
+    groups = {}
+    for item in collected:
+        groups.setdefault(item["cat_key"], []).append(item)
+    for items in groups.values():
+        items.sort(key=lambda x: x["ts"])
+
+    # 按分类优先级，把所有条目拉平成一个"分组块"列表：[(cat_key, cat_label, [items...]), ...]
+    blocks = []
+    for key in CATEGORY_ORDER:
+        items = groups.get(key)
+        if items:
+            label = items[0]["cat_label"]
+            blocks.append((key, label, items))
+
+    total_items = sum(len(items) for _, _, items in blocks)
+
+    cards = []
+    current_lines = []
+    current_count = 0
+    current_alert = False
+    current_colors = set()
+
+    def flush_card():
+        nonlocal current_lines, current_count, current_alert, current_colors
+        if current_lines:
+            color = "red" if current_alert else (
+                sorted(current_colors)[0] if len(current_colors) == 1 else "blue"
+            )
+            cards.append(("\n".join(current_lines).strip(), current_alert, color))
+        current_lines, current_count, current_alert, current_colors = [], 0, False, set()
+
+    for key, label, items in blocks:
+        if len(cards) >= MAX_CARDS_PER_RUN - 1 and current_count >= MAX_ITEMS_PER_CARD:
+            break  # 最后一张卡片也满了，剩下的条目直接跳过，只在末尾提示条数
+
+        if current_count + len(items) > MAX_ITEMS_PER_CARD and current_lines:
+            flush_card()
+            if len(cards) >= MAX_CARDS_PER_RUN:
+                break
+
+        current_lines.append(f"**{label}**（{len(items)}条）")
+        for i, it in enumerate(items, 1):
+            tag = f" · {it['sentiment']}" if it["sentiment"] != "中性" else ""
+            current_lines.append(
+                f"{i}. [{it['title']}]({it['link']}){tag}　*{it['source']}*"
+            )
+        current_lines.append("")
+        current_count += len(items)
+        if key in ALERT_CATEGORIES:
+            current_alert = True
+        current_colors.add(CATEGORY_COLOR.get(key, "blue"))
+
+    flush_card()
+
+    shown = sum(1 for _ in cards) and sum(
+        len([l for l in c[0].split("\n") if re.match(r"^\d+\.", l)]) for c in cards
+    )
+    if shown < total_items and cards:
+        text, alert, color = cards[-1]
+        remaining = total_items - shown
+        text += f"\n\n_另有 {remaining} 条较次要资讯，可稍后在财联社 / 华尔街见闻客户端查看_"
+        cards[-1] = (text, alert, color)
+
+    return cards[:MAX_CARDS_PER_RUN]
+
+
+def send_card(text, alert, color, page_info=""):
     if not FEISHU_WEBHOOK:
         print("未配置 FEISHU_WEBHOOK，跳过推送，仅打印：")
         print(text)
         return
 
-    if is_important:
-        # 重要消息：红色卡片 + @所有人
-        payload = {
-            "msg_type": "interactive",
-            "card": {
-                "header": {
-                    "title": {"tag": "plain_text", "content": ("🟢 AI算力机器人快讯" if is_ai else ("🟣 半导体芯片快讯" if is_semiconductor else ("🔵 商品期货快讯" if is_commodity else ("🟡 战争地缘政治快讯" if is_war else ("🟥 重要政策快讯" if is_policy else "🔴 财联社重要电报")))))},
-                    "template": ("green" if is_ai else ("purple" if is_semiconductor else ("blue" if is_commodity else ("yellow" if is_war else ("red" if is_policy else "red"))))),
-                },
-                "elements": [
-                    {"tag": "div", "text": {"tag": "lark_md", "content": text}},
-                    {"tag": "div", "text": {"tag": "lark_md", "content": "<at id=all></at>"}},
-                ],
+    title = "📊 财经快讯速览" + (f" {page_info}" if page_info else "")
+    elements = [{"tag": "div", "text": {"tag": "lark_md", "content": text}}]
+    if alert:
+        elements.append({"tag": "div", "text": {"tag": "lark_md", "content": "<at id=all></at>"}})
+
+    payload = {
+        "msg_type": "interactive",
+        "card": {
+            "header": {
+                "title": {"tag": "plain_text", "content": title},
+                "template": color,
             },
-        }
-    else:
-        payload = {"msg_type": "text", "content": {"text": text}}
+            "elements": elements,
+        },
+    }
 
     try:
         resp = requests.post(FEISHU_WEBHOOK, json=payload, timeout=10)
@@ -248,128 +391,27 @@ def send_to_feishu(text, is_important=False, is_war=False, is_commodity=False, i
             print("飞书推送返回异常：", result)
     except Exception as ex:
         print("推送失败：", ex)
-    # 避免推送过快被限流
     time.sleep(0.3)
-
-
-def process_source(path, seen, source_key, label, is_important=False):
-    if not path:
-        return
-    print(f"开始抓取：{label}")
-    try:
-        entries = fetch_entries(path)
-    except Exception as ex:
-        print(f"抓取 {label} 失败：{ex}")
-        return
-
-    seen_ids = set(seen.get(source_key, []))
-    recent_titles = seen.setdefault("_recent_titles", [])
-
-    new_entries = [e for e in entries if e[0] not in seen_ids]
-
-    # 首次运行（seen_ids 为空）时不刷屏，只记录不推送，但要把标题存进"最近标题池"，
-    # 这样下一次真正开始推送时，不会因为看不到这些历史标题而误判重复
-    first_run = len(seen_ids) == 0
-
-    to_consider = new_entries[-MAX_PUSH_PER_SOURCE:] if new_entries else []
-
-    pushed_count = 0
-    skipped_dup_count = 0
-
-    for entry_id, title, summary, link, ts in new_entries:
-        seen_ids.add(entry_id)
-
-    if not first_run:
-        for entry_id, title, summary, link, ts in to_consider:
-            if is_duplicate_across_sources(title, recent_titles):
-                skipped_dup_count += 1
-                print(f"  跳过（跟其他来源重复）：{title}")
-                continue
-            preview = summary[:120] if summary else ""
-            text = f"{label}\n\n{title}\n\n{preview}\n\n{link}" if link else f"{label}\n\n{title}\n\n{preview}"
-            war_flag = is_war_news(title, summary)
-            commodity_flag = is_commodity_news(title, summary)
-            ai_flag = is_ai_news(title, summary)
-            semiconductor_flag = is_semiconductor_news(title, summary)
-            policy_flag = is_policy_news(title, summary)
-            send_to_feishu(
-                text,
-                is_important=is_important,
-                is_war=war_flag,
-                is_commodity=commodity_flag,
-                is_ai=ai_flag,
-                is_semiconductor=semiconductor_flag,
-                is_policy=policy_flag
-            )
-            pushed_count += 1
-            recent_titles.append({
-                "norm": normalize_title(title),
-                "ts": time.time(),
-                "source": source_key,
-            })
-        print(f"{label}：本次推送 {pushed_count} 条，因跨源重复跳过 {skipped_dup_count} 条")
-    else:
-        # 首次运行：把已有标题也记进"最近标题池"，作为去重的起点
-        for entry_id, title, summary, link, ts in new_entries[-MAX_PUSH_PER_SOURCE:]:
-            recent_titles.append({
-                "norm": normalize_title(title),
-                "ts": time.time(),
-                "source": source_key,
-            })
-        print(f"{label} 首次运行，记录 {len(new_entries)} 条历史消息，不推送")
-
-    # 只保留最近 500 条 id，防止文件无限增大
-    seen[source_key] = list(seen_ids)[-500:]
-
-    # 清理"最近标题池"：只留 DEDUP_WINDOW_SECONDS 时间窗口内的，避免文件越滚越大
-    now = time.time()
-    seen["_recent_titles"] = [
-        item for item in recent_titles if now - item.get("ts", 0) <= DEDUP_WINDOW_SECONDS
-    ][-300:]
 
 
 def main():
     seen = load_seen()
+    collected = []
 
-    process_source(CLS_RED_PATH, seen, "cls_red", "🔴 财联社重要电报", is_important=True)
-    process_source(WALLSTREETCN_PATH, seen, "wallstreetcn", "🟠 华尔街见闻快讯", is_important=True)
-    process_source(JIN10_PATH, seen, "jin10", "🌍 金十数据重要资讯", is_important=True)
+    for path, source_key, source_label in SOURCES:
+        process_source(path, source_key, source_label, seen, collected)
+
+    cards = build_card_bodies(collected)
+    total_cards = len(cards)
+    for idx, (text, alert, color) in enumerate(cards, 1):
+        page_info = f"({idx}/{total_cards})" if total_cards > 1 else ""
+        send_card(text, alert, color, page_info)
+
+    if not cards:
+        print("本次没有需要推送的新消息")
 
     save_seen(seen)
 
 
 if __name__ == "__main__":
     main()
-
-
-# ================= V4 板块映射增强 =================
-
-SECTOR_KEYWORDS = {
-    "机器人": ["机器人","人形机器人","工业机器人"],
-    "AI算力": ["AI","人工智能","算力","GPU","数据中心","大模型"],
-    "半导体": ["半导体","芯片","晶圆","光刻机","HBM"],
-    "军工": ["军工","导弹","战机","航母","国防"],
-    "创新药": ["创新药","CXO","ADC","减肥药","PD-1"],
-    "新能源": ["碳酸锂","锂矿","储能","光伏","风电"],
-    "黄金有色": ["黄金","白银","铜","铝","镍","稀土"],
-}
-
-def detect_sectors(title, summary=""):
-    text = f"{title} {summary}".lower()
-    sectors = []
-    for sector, kws in SECTOR_KEYWORDS.items():
-        if any(k.lower() in text for k in kws):
-            sectors.append(sector)
-    return sectors
-
-def sentiment_hint(title, summary=""):
-    text = f"{title} {summary}"
-    positive = ["突破","增长","扩大","签约","利好","创新高","上调","增持"]
-    negative = ["下滑","制裁","下调","减持","亏损","调查","处罚"]
-    p = sum(1 for x in positive if x in text)
-    n = sum(1 for x in negative if x in text)
-    if p > n:
-        return "利好"
-    if n > p:
-        return "利空"
-    return "中性"
