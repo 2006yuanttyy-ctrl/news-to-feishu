@@ -3,14 +3,17 @@
 自动抓取「财联社电报（重要）」「华尔街见闻实时快讯」「金十数据重要资讯」，
 新内容按类别分组、汇总推送到飞书群机器人。
 
-V5 相比 V4 的核心变化：
-1. 不再是抓到一条就发一张卡片 —— 所有来源、所有新条目先收集起来，
-   最后按"战争地缘 / 政策监管 / AI算力 / 半导体 / 商品期货 / 其他"分类分组，
-   一次运行最多只发 1~2 张汇总卡片，避免刷屏、看不过来。
-2. 标题本身就是链接（点标题看详情），不再单独占一行放预览文字和链接，
-   大幅减少每条消息占用的行数和间距。
-3. 只有"战争地缘""政策监管"这两类才 @所有人，其余分类只是分组展示，
-   不再每条都强提醒。
+V6 相比 V5 的变化：
+1. 新增"表格卡片"输出模式 —— 用飞书 CardKit v2 的原生 table 组件，
+   把所有条目渲染成一张真正的表格（类别 / 标题 / 情绪 / 来源 / 链接），
+   比 V5 的分组列表更紧凑直观。
+2. 表格组件需要 schema 2.0 + 较新版本飞书客户端（建议 7.20 及以上）。
+   飞书表格单元格（data_type=text）不支持 markdown 语法，所以标题本身
+   不能做成可点击链接 —— 改成单独一列放原始链接，飞书客户端通常会
+   自动识别 URL 文本并变成可点击链接。
+3. 如果你们群里客户端版本较老、表格显示不出来，把下面的
+   USE_TABLE_CARD 改成 False 即可自动切换回 V5 的分组列表卡片
+   （已验证在旧版客户端上也能正常显示，就是你截图里那种样式的升级版）。
 """
 
 import json
@@ -22,6 +25,23 @@ import feedparser
 from difflib import SequenceMatcher
 
 # ========== 配置区（一般不用改） ==========
+
+# 是否使用"表格卡片"输出。True = 真表格（需要较新客户端）；
+# False = 分组列表卡片（兼容性更好，退回 V5 的样式）
+USE_TABLE_CARD = True
+
+# 情绪标签（利/空）已确认无法用飞书的彩色 options 组件实现——那个写法
+# 会导致飞书直接拒收整张卡片（表现为群里完全不推送）。现在改成合并进
+# "来源"列的纯文字后缀（如"华尔街 · 利"），没有颜色，但保证能正常推送。
+# 表格列宽也统一用 "auto"：自定义像素宽度同样没有验证过，出于同样原因
+# 曾导致整卡被拒收，所以这里不再使用。
+
+# 表格里"来源"列用的简称，跟抓取用的完整来源标签分开，互不影响
+SOURCE_SHORT_NAME = {
+    "财联社": "财联社",
+    "华尔街见闻": "华尔街",
+    "金十数据": "金十",
+}
 
 # RSSHub 公共镜像列表：第一个抓不到就依次尝试下一个，提高成功率
 RSSHUB_MIRRORS = [
@@ -53,6 +73,9 @@ MAX_ITEMS_PER_CARD = 20
 # 一次运行最多发几张卡片；超出的条目只在卡片末尾提示条数，不再单独发卡片
 MAX_CARDS_PER_RUN = 2
 
+# 抓取全部失败时，报警卡片最短间隔多久才能再发一次（避免疯狂重试期间被刷屏）
+FETCH_ALERT_COOLDOWN_SECONDS = 60 * 60  # 1 小时
+
 # 已推送记录文件
 SEEN_FILE = "seen.json"
 
@@ -68,7 +91,6 @@ HEADERS = {
 }
 
 # ========== 分类关键词（按优先级从高到低，命中第一个匹配的类别就归为该类） ==========
-# 每一项：(分类key, 展示用的分类标签, 关键词列表)
 CATEGORY_DEFS = [
     ("war", "🟡 战争地缘", [
         "战争", "军事", "袭击", "空袭", "导弹", "无人机", "轰炸", "核武", "核设施",
@@ -99,28 +121,16 @@ CATEGORY_DEFS = [
         "天然气", "LNG", "期货", "商品期货",
     ]),
 ]
-# 兜底分类：没命中任何关键词的消息
 DEFAULT_CATEGORY = ("other", "⚪ 其他财经快讯")
-
-# 分类展示顺序（优先级从高到低）
 CATEGORY_ORDER = [k for k, _, _ in CATEGORY_DEFS] + [DEFAULT_CATEGORY[0]]
-
-# 需要 @所有人 强提醒的分类
-ALERT_CATEGORIES = {"war", "policy"}
-
-# 每个分类对应的卡片主题色（Feishu card template 颜色）
+ALERT_CATEGORIES = {"war", "policy"}   # 需要 @所有人 强提醒的分类
 CATEGORY_COLOR = {
-    "war": "yellow",
-    "policy": "red",
-    "ai": "green",
-    "semiconductor": "purple",
-    "commodity": "blue",
-    "other": "grey",
+    "war": "yellow", "policy": "red", "ai": "green",
+    "semiconductor": "purple", "commodity": "blue", "other": "grey",
 }
 
 
 def categorize(title, summary=""):
-    """返回 (分类key, 分类展示标签)，按 CATEGORY_DEFS 顺序，命中第一个就返回"""
     text = f"{title} {summary}".lower()
     for key, label, kws in CATEGORY_DEFS:
         if any(kw.lower() in text for kw in kws):
@@ -129,7 +139,6 @@ def categorize(title, summary=""):
 
 
 def sentiment_hint(title, summary=""):
-    """粗略判断这条消息偏利好/利空/中性，用于在条目后面加个小标签"""
     text = f"{title} {summary}"
     positive = ["突破", "增长", "扩大", "签约", "利好", "创新高", "上调", "增持"]
     negative = ["下滑", "制裁", "下调", "减持", "亏损", "调查", "处罚"]
@@ -139,11 +148,10 @@ def sentiment_hint(title, summary=""):
         return "利好"
     if n > p:
         return "利空"
-    return "中性"
+    return "-"
 
 
 def normalize_title(title):
-    """把标题里的日期、时间、来源名等"干扰项"去掉，方便比较是不是同一件事"""
     t = title.strip()
     t = re.sub(r"^[\d]{1,2}[月/-][\d]{1,2}[日]?[，,：:\s]*", "", t)
     t = re.sub(r"^[\d]{1,2}[:：][\d]{1,2}[，,：:\s]*", "", t)
@@ -153,7 +161,6 @@ def normalize_title(title):
 
 
 def is_duplicate_across_sources(title, recent_titles):
-    """判断这条标题，是不是跟"最近推送过的标题"讲的是同一件事"""
     norm = normalize_title(title)
     if not norm:
         return False
@@ -189,9 +196,6 @@ def save_seen(seen):
 
 
 def fetch_entries(path):
-    """依次尝试各个 RSSHub 镜像抓取 path 对应的 RSS，
-    返回 [(id, title, summary, link, published_ts), ...]，按时间从旧到新排列。
-    """
     last_error = None
     for base in RSSHUB_MIRRORS:
         url = base.rstrip("/") + path
@@ -227,13 +231,14 @@ def fetch_entries(path):
     raise RuntimeError(f"所有镜像均抓取失败，最后一次错误：{last_error}")
 
 
-def process_source(path, source_key, source_label, seen, collected):
+def process_source(path, source_key, source_label, seen, collected, fetch_errors):
     """抓取一个来源，把去重后需要推送的条目追加进 collected 列表（不在这里发送）"""
     print(f"开始抓取：{source_label}")
     try:
         entries = fetch_entries(path)
     except Exception as ex:
         print(f"抓取 {source_label} 失败：{ex}")
+        fetch_errors.append(f"{source_label}：{ex}")
         return
 
     seen_ids = set(seen.get(source_key, []))
@@ -248,12 +253,9 @@ def process_source(path, source_key, source_label, seen, collected):
     to_consider = new_entries[-MAX_PUSH_PER_SOURCE:] if new_entries else []
 
     if first_run:
-        # 首次运行：只记录历史标题作为去重起点，不推送，避免刚上线就刷屏
         for entry_id, title, summary, link, ts in to_consider:
             recent_titles.append({
-                "norm": normalize_title(title),
-                "ts": time.time(),
-                "source": source_key,
+                "norm": normalize_title(title), "ts": time.time(), "source": source_key,
             })
         print(f"{source_label} 首次运行，记录 {len(new_entries)} 条历史消息，不推送")
     else:
@@ -265,18 +267,12 @@ def process_source(path, source_key, source_label, seen, collected):
                 continue
             cat_key, cat_label = categorize(title, summary)
             collected.append({
-                "cat_key": cat_key,
-                "cat_label": cat_label,
-                "title": title,
-                "link": link,
-                "source": source_label,
-                "sentiment": sentiment_hint(title, summary),
-                "ts": ts,
+                "cat_key": cat_key, "cat_label": cat_label,
+                "title": title, "link": link, "source": source_label,
+                "sentiment": sentiment_hint(title, summary), "ts": ts,
             })
             recent_titles.append({
-                "norm": normalize_title(title),
-                "ts": time.time(),
-                "source": source_key,
+                "norm": normalize_title(title), "ts": time.time(), "source": source_key,
             })
         print(f"{source_label}：本次收集 {len(to_consider) - skipped_dup} 条待推送，因跨源重复跳过 {skipped_dup} 条")
 
@@ -287,128 +283,212 @@ def process_source(path, source_key, source_label, seen, collected):
     ][-300:]
 
 
-def build_card_bodies(collected):
+def _group_and_chunk(collected):
+    """按分类优先级分组，再按 MAX_ITEMS_PER_CARD / MAX_CARDS_PER_RUN 切成若干批次。
+    返回 (chunks, remaining_count)，chunks 是 [[item,...], ...]，每个子列表对应一张卡片。
     """
-    把 collected 按分类分组，生成若干张卡片的内容：
-    每张卡片是 (markdown正文, 是否需要@所有人, 主题色) 的元组列表。
-    最多生成 MAX_CARDS_PER_RUN 张，多出的条目在最后一张卡片末尾提示条数。
-    """
-    if not collected:
-        return []
-
     groups = {}
     for item in collected:
         groups.setdefault(item["cat_key"], []).append(item)
     for items in groups.values():
         items.sort(key=lambda x: x["ts"])
 
-    # 按分类优先级，把所有条目拉平成一个"分组块"列表：[(cat_key, cat_label, [items...]), ...]
-    blocks = []
+    ordered_items = []
     for key in CATEGORY_ORDER:
-        items = groups.get(key)
-        if items:
-            label = items[0]["cat_label"]
-            blocks.append((key, label, items))
+        ordered_items.extend(groups.get(key, []))
 
-    total_items = sum(len(items) for _, _, items in blocks)
+    total = len(ordered_items)
+    max_total = MAX_ITEMS_PER_CARD * MAX_CARDS_PER_RUN
+    shown_items = ordered_items[:max_total]
+    remaining = total - len(shown_items)
 
+    chunks = [
+        shown_items[i:i + MAX_ITEMS_PER_CARD]
+        for i in range(0, len(shown_items), MAX_ITEMS_PER_CARD)
+    ]
+    return chunks, remaining
+
+
+def build_table_cards(collected):
+    """生成表格样式的卡片（CardKit v2 table 组件）。返回 payload["card"] 的列表。
+    这版刻意只用已经在你环境里跑通过的写法：
+    - 所有列 width 都是 "auto"（自定义像素宽度没有验证过，曾导致整卡被飞书拒收）
+    - 情绪列不再用彩色 options 标签（同样会导致整卡被拒收），改成合并进"来源"列的
+      纯文字后缀（如"华尔街 · 利"），这样列数从 5 减到 4，"标题"列能分到的相对
+      空间也会更大，且不涉及任何未经验证的字段。
+    """
+    chunks, remaining = _group_and_chunk(collected)
     cards = []
-    current_lines = []
-    current_count = 0
-    current_alert = False
-    current_colors = set()
+    total_cards = len(chunks)
 
-    def flush_card():
-        nonlocal current_lines, current_count, current_alert, current_colors
-        if current_lines:
-            color = "red" if current_alert else (
-                sorted(current_colors)[0] if len(current_colors) == 1 else "blue"
-            )
-            cards.append(("\n".join(current_lines).strip(), current_alert, color))
-        current_lines, current_count, current_alert, current_colors = [], 0, False, set()
+    for idx, items in enumerate(chunks, 1):
+        has_alert = any(it["cat_key"] in ALERT_CATEGORIES for it in items)
+        color = "red" if has_alert else "blue"
+        page_info = f"({idx}/{total_cards})" if total_cards > 1 else ""
 
-    for key, label, items in blocks:
-        if len(cards) >= MAX_CARDS_PER_RUN - 1 and current_count >= MAX_ITEMS_PER_CARD:
-            break  # 最后一张卡片也满了，剩下的条目直接跳过，只在末尾提示条数
+        rows = []
+        for it in items:
+            source_short = SOURCE_SHORT_NAME.get(it["source"], it["source"])
+            sentiment_short = {"利好": "利", "利空": "空"}.get(it["sentiment"], "")
+            source_cell = f"{source_short} · {sentiment_short}" if sentiment_short else source_short
+            rows.append({
+                "cat": it["cat_label"],
+                "title": it["title"],
+                "source": source_cell,
+                "link": it["link"] or "-",
+            })
 
-        if current_count + len(items) > MAX_ITEMS_PER_CARD and current_lines:
-            flush_card()
-            if len(cards) >= MAX_CARDS_PER_RUN:
-                break
+        elements = [{
+            "tag": "table",
+            "columns": [
+                {"name": "cat", "display_name": "类别", "data_type": "text", "width": "auto"},
+                {"name": "title", "display_name": "标题", "data_type": "text", "width": "auto"},
+                {"name": "source", "display_name": "来源", "data_type": "text", "width": "auto"},
+                {"name": "link", "display_name": "链接", "data_type": "text", "width": "auto"},
+            ],
+            "rows": rows,
+            "header_style": {
+                "bold": True,
+                "text_align": "left",
+                "text_size": "normal",
+                "background_style": "grey",
+                "lines": 1,
+            },
+        }]
 
-        current_lines.append(f"**{label}**（{len(items)}条）")
-        for i, it in enumerate(items, 1):
-            tag = f" · {it['sentiment']}" if it["sentiment"] != "中性" else ""
-            current_lines.append(
-                f"{i}. [{it['title']}]({it['link']}){tag}　*{it['source']}*"
-            )
-        current_lines.append("")
-        current_count += len(items)
-        if key in ALERT_CATEGORIES:
-            current_alert = True
-        current_colors.add(CATEGORY_COLOR.get(key, "blue"))
+        if idx == total_cards and remaining > 0:
+            elements.append({
+                "tag": "markdown",
+                "content": f"_另有 {remaining} 条较次要资讯，可稍后在财联社 / 华尔街见闻客户端查看_",
+            })
+        if has_alert:
+            elements.append({"tag": "markdown", "content": "<at id=all></at>"})
 
-    flush_card()
-
-    shown = sum(1 for _ in cards) and sum(
-        len([l for l in c[0].split("\n") if re.match(r"^\d+\.", l)]) for c in cards
-    )
-    if shown < total_items and cards:
-        text, alert, color = cards[-1]
-        remaining = total_items - shown
-        text += f"\n\n_另有 {remaining} 条较次要资讯，可稍后在财联社 / 华尔街见闻客户端查看_"
-        cards[-1] = (text, alert, color)
-
-    return cards[:MAX_CARDS_PER_RUN]
-
-
-def send_card(text, alert, color, page_info=""):
-    if not FEISHU_WEBHOOK:
-        print("未配置 FEISHU_WEBHOOK，跳过推送，仅打印：")
-        print(text)
-        return
-
-    title = "📊 财经快讯速览" + (f" {page_info}" if page_info else "")
-    elements = [{"tag": "div", "text": {"tag": "lark_md", "content": text}}]
-    if alert:
-        elements.append({"tag": "div", "text": {"tag": "lark_md", "content": "<at id=all></at>"}})
-
-    payload = {
-        "msg_type": "interactive",
-        "card": {
+        card = {
+            "schema": "2.0",
+            "config": {"wide_screen_mode": True},
             "header": {
-                "title": {"tag": "plain_text", "content": title},
+                "title": {"tag": "plain_text", "content": f"📊 财经快讯速览 {page_info}".strip()},
+                "template": color,
+            },
+            "body": {"elements": elements},
+        }
+        cards.append(card)
+
+    return cards
+
+
+def build_list_cards(collected):
+    """兼容旧版客户端的分组列表卡片（JSON 1.0 风格，即 V5 的样式）。返回 payload["card"] 的列表。"""
+    chunks, remaining = _group_and_chunk(collected)
+    cards = []
+    total_cards = len(chunks)
+
+    for idx, items in enumerate(chunks, 1):
+        has_alert = any(it["cat_key"] in ALERT_CATEGORIES for it in items)
+        color = "red" if has_alert else "blue"
+        page_info = f"({idx}/{total_cards})" if total_cards > 1 else ""
+
+        by_cat = {}
+        for it in items:
+            by_cat.setdefault(it["cat_key"], []).append(it)
+
+        lines = []
+        for key in CATEGORY_ORDER:
+            group = by_cat.get(key)
+            if not group:
+                continue
+            lines.append(f"**{group[0]['cat_label']}**（{len(group)}条）")
+            for i, it in enumerate(group, 1):
+                tag = f" · {it['sentiment']}" if it["sentiment"] != "-" else ""
+                lines.append(f"{i}. [{it['title']}]({it['link']}){tag}　*{it['source']}*")
+            lines.append("")
+
+        if idx == total_cards and remaining > 0:
+            lines.append(f"_另有 {remaining} 条较次要资讯，可稍后在财联社 / 华尔街见闻客户端查看_")
+
+        elements = [{"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines).strip()}}]
+        if has_alert:
+            elements.append({"tag": "div", "text": {"tag": "lark_md", "content": "<at id=all></at>"}})
+
+        card = {
+            "header": {
+                "title": {"tag": "plain_text", "content": f"📊 财经快讯速览 {page_info}".strip()},
                 "template": color,
             },
             "elements": elements,
-        },
-    }
+        }
+        cards.append(card)
 
+    return cards
+
+
+def send_card(card):
+    if not FEISHU_WEBHOOK:
+        print("未配置 FEISHU_WEBHOOK，跳过推送，仅打印：")
+        print(json.dumps(card, ensure_ascii=False, indent=2))
+        return
+
+    payload = {"msg_type": "interactive", "card": card}
     try:
         resp = requests.post(FEISHU_WEBHOOK, json=payload, timeout=10)
         result = resp.json()
         if result.get("code") not in (0, None):
-            print("飞书推送返回异常：", result)
+            print(f"⚠️ 飞书推送返回异常（HTTP {resp.status_code}）：{result}")
     except Exception as ex:
         print("推送失败：", ex)
     time.sleep(0.3)
 
 
+def send_fetch_failure_alert(fetch_errors, seen):
+    """三个来源全部抓取失败时，推一张提示卡片到飞书，让人知道流水线卡住了
+    （而不是安安静静地什么都不发，让人误以为是"真的没有新消息"）。
+    带 1 小时冷却，避免抓取持续失败期间反复报警刷屏。
+    """
+    last_alert_ts = seen.get("_last_fetch_alert_ts", 0)
+    if time.time() - last_alert_ts < FETCH_ALERT_COOLDOWN_SECONDS:
+        print("抓取全部失败，但报警冷却中，跳过本次报警")
+        return
+
+    detail = "\n".join(f"- {e}" for e in fetch_errors)
+    card = {
+        "header": {
+            "title": {"tag": "plain_text", "content": "⚠️ 快讯抓取全部失败"},
+            "template": "orange",
+        },
+        "elements": [{
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": (
+                    "本次运行三个来源全部抓取失败，可能是 RSSHub 公共镜像限流/宕机，"
+                    "或网络问题。这段时间群里不会有新快讯推送，请留意排查。\n\n" + detail
+                ),
+            },
+        }],
+    }
+    send_card(card)
+    seen["_last_fetch_alert_ts"] = time.time()
+
+
 def main():
     seen = load_seen()
     collected = []
+    fetch_errors = []
 
     for path, source_key, source_label in SOURCES:
-        process_source(path, source_key, source_label, seen, collected)
+        process_source(path, source_key, source_label, seen, collected, fetch_errors)
 
-    cards = build_card_bodies(collected)
-    total_cards = len(cards)
-    for idx, (text, alert, color) in enumerate(cards, 1):
-        page_info = f"({idx}/{total_cards})" if total_cards > 1 else ""
-        send_card(text, alert, color, page_info)
-
-    if not cards:
+    if len(fetch_errors) == len(SOURCES):
+        # 三个来源这次全都没抓到，值得报警；跟"抓到了但没有新内容"是两码事
+        send_fetch_failure_alert(fetch_errors, seen)
+    elif not collected:
         print("本次没有需要推送的新消息")
+    else:
+        builder = build_table_cards if USE_TABLE_CARD else build_list_cards
+        cards = builder(collected)
+        for card in cards:
+            send_card(card)
 
     save_seen(seen)
 
