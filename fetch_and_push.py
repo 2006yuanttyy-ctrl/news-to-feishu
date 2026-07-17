@@ -30,6 +30,27 @@ from difflib import SequenceMatcher
 # False = 分组列表卡片（兼容性更好，退回 V5 的样式）
 USE_TABLE_CARD = True
 
+# 情绪列是否用飞书"选项标签"组件做成彩色单字（利=红/空=绿）。
+# 这个子功能没能拿到 100% 权威的字段格式确认，如果表格里"情绪"这一列
+# 显示异常（比如显示成一串奇怪的文字/报错），把这个改成 False，
+# 会自动退回成纯文字"利/空/-"（没有颜色，但保证能正常显示）。
+SENTIMENT_AS_COLOR_TAG = True
+
+# 表格里"来源"列用的简称，跟抓取用的完整来源标签分开，互不影响
+SOURCE_SHORT_NAME = {
+    "财联社": "财联社",
+    "华尔街见闻": "华尔街",
+    "金十数据": "金十",
+}
+
+# 表格各列宽度：数字/窄列给固定像素，"标题"列不设宽度、自动占满剩余空间
+TABLE_COL_WIDTH = {
+    "cat": "90px",
+    "sentiment": "50px",
+    "source": "70px",
+    "link": "160px",
+}
+
 # RSSHub 公共镜像列表：第一个抓不到就依次尝试下一个，提高成功率
 RSSHUB_MIRRORS = [
     "https://rsshub.app",
@@ -305,27 +326,49 @@ def build_table_cards(collected):
 
         rows = []
         for it in items:
-            rows.append({
+            row = {
                 "cat": it["cat_label"],
                 "title": it["title"],
-                "sentiment": it["sentiment"],
-                "source": it["source"],
+                "source": SOURCE_SHORT_NAME.get(it["source"], it["source"]),
                 "link": it["link"] or "-",
-            })
+            }
+            if SENTIMENT_AS_COLOR_TAG:
+                if it["sentiment"] == "利好":
+                    row["sentiment"] = [{"id": "up", "text": "利", "color": "red"}]
+                elif it["sentiment"] == "利空":
+                    row["sentiment"] = [{"id": "down", "text": "空", "color": "green"}]
+                else:
+                    row["sentiment"] = []
+            else:
+                row["sentiment"] = {"利好": "利", "利空": "空"}.get(it["sentiment"], "-")
+            rows.append(row)
+
+        sentiment_column = {
+            "name": "sentiment", "display_name": "情绪",
+            "width": TABLE_COL_WIDTH["sentiment"],
+        }
+        if SENTIMENT_AS_COLOR_TAG:
+            sentiment_column["data_type"] = "options"
+            sentiment_column["options"] = [
+                {"id": "up", "text": "利", "color": "red"},
+                {"id": "down", "text": "空", "color": "green"},
+            ]
+        else:
+            sentiment_column["data_type"] = "text"
 
         elements = [{
             "tag": "table",
             "columns": [
-                {"name": "cat", "display_name": "类别", "data_type": "text", "width": "auto"},
-                {"name": "title", "display_name": "标题", "data_type": "text", "width": "auto"},
-                {"name": "sentiment", "display_name": "情绪", "data_type": "text", "width": "auto"},
-                {"name": "source", "display_name": "来源", "data_type": "text", "width": "auto"},
-                {"name": "link", "display_name": "链接", "data_type": "text", "width": "auto"},
+                {"name": "cat", "display_name": "类别", "data_type": "text", "width": TABLE_COL_WIDTH["cat"]},
+                {"name": "title", "display_name": "标题", "data_type": "text"},  # 不设宽度，自动占满剩余空间
+                sentiment_column,
+                {"name": "source", "display_name": "来源", "data_type": "text", "width": TABLE_COL_WIDTH["source"]},
+                {"name": "link", "display_name": "链接", "data_type": "text", "width": TABLE_COL_WIDTH["link"]},
             ],
             "rows": rows,
             "header_style": {
                 "bold": True,
-                "text_align": "left",
+                "text_align": "center",
                 "text_size": "normal",
                 "background_style": "grey",
                 "lines": 1,
