@@ -81,6 +81,9 @@ MAX_ITEMS_PER_CARD = 20
 # 一次运行最多发几张卡片；超出的条目只在卡片末尾提示条数，不再单独发卡片
 MAX_CARDS_PER_RUN = 2
 
+# 抓取全部失败时，报警卡片最短间隔多久才能再发一次（避免疯狂重试期间被刷屏）
+FETCH_ALERT_COOLDOWN_SECONDS = 60 * 60  # 1 小时
+
 # 已推送记录文件
 SEEN_FILE = "seen.json"
 
@@ -236,13 +239,14 @@ def fetch_entries(path):
     raise RuntimeError(f"所有镜像均抓取失败，最后一次错误：{last_error}")
 
 
-def process_source(path, source_key, source_label, seen, collected):
+def process_source(path, source_key, source_label, seen, collected, fetch_errors):
     """抓取一个来源，把去重后需要推送的条目追加进 collected 列表（不在这里发送）"""
     print(f"开始抓取：{source_label}")
     try:
         entries = fetch_entries(path)
     except Exception as ex:
         print(f"抓取 {source_label} 失败：{ex}")
+        fetch_errors.append(f"{source_label}：{ex}")
         return
 
     seen_ids = set(seen.get(source_key, []))
@@ -459,14 +463,49 @@ def send_card(card):
     time.sleep(0.3)
 
 
+def send_fetch_failure_alert(fetch_errors, seen):
+    """三个来源全部抓取失败时，推一张提示卡片到飞书，让人知道流水线卡住了
+    （而不是安安静静地什么都不发，让人误以为是"真的没有新消息"）。
+    带 1 小时冷却，避免抓取持续失败期间反复报警刷屏。
+    """
+    last_alert_ts = seen.get("_last_fetch_alert_ts", 0)
+    if time.time() - last_alert_ts < FETCH_ALERT_COOLDOWN_SECONDS:
+        print("抓取全部失败，但报警冷却中，跳过本次报警")
+        return
+
+    detail = "\n".join(f"- {e}" for e in fetch_errors)
+    card = {
+        "header": {
+            "title": {"tag": "plain_text", "content": "⚠️ 快讯抓取全部失败"},
+            "template": "orange",
+        },
+        "elements": [{
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": (
+                    "本次运行三个来源全部抓取失败，可能是 RSSHub 公共镜像限流/宕机，"
+                    "或网络问题。这段时间群里不会有新快讯推送，请留意排查。\n\n" + detail
+                ),
+            },
+        }],
+    }
+    send_card(card)
+    seen["_last_fetch_alert_ts"] = time.time()
+
+
 def main():
     seen = load_seen()
     collected = []
+    fetch_errors = []
 
     for path, source_key, source_label in SOURCES:
-        process_source(path, source_key, source_label, seen, collected)
+        process_source(path, source_key, source_label, seen, collected, fetch_errors)
 
-    if not collected:
+    if len(fetch_errors) == len(SOURCES):
+        # 三个来源这次全都没抓到，值得报警；跟"抓到了但没有新内容"是两码事
+        send_fetch_failure_alert(fetch_errors, seen)
+    elif not collected:
         print("本次没有需要推送的新消息")
     else:
         builder = build_table_cards if USE_TABLE_CARD else build_list_cards
