@@ -31,10 +31,11 @@ from difflib import SequenceMatcher
 USE_TABLE_CARD = True
 
 # 情绪列是否用飞书"选项标签"组件做成彩色单字（利=红/空=绿）。
-# 这个子功能没能拿到 100% 权威的字段格式确认，如果表格里"情绪"这一列
-# 显示异常（比如显示成一串奇怪的文字/报错），把这个改成 False，
-# 会自动退回成纯文字"利/空/-"（没有颜色，但保证能正常显示）。
-SENTIMENT_AS_COLOR_TAG = True
+# 已确认：这个 data_type=options 写法会导致飞书直接拒收整张卡片（表现为
+# 群里完全不推送，日志里能看到 code 不为 0 的报错）。默认关掉，
+# 情绪列退回纯文字"利/空/-"（没有颜色，但保证能正常推送）。
+# 如果你后面确认了正确的 options 字段格式，可以再打开。
+SENTIMENT_AS_COLOR_TAG = False
 
 # 表格里"来源"列用的简称，跟抓取用的完整来源标签分开，互不影响
 SOURCE_SHORT_NAME = {
@@ -457,7 +458,7 @@ def send_card(card):
         resp = requests.post(FEISHU_WEBHOOK, json=payload, timeout=10)
         result = resp.json()
         if result.get("code") not in (0, None):
-            print("飞书推送返回异常：", result)
+            print(f"⚠️ 飞书推送返回异常（HTTP {resp.status_code}）：{result}")
     except Exception as ex:
         print("推送失败：", ex)
     time.sleep(0.3)
