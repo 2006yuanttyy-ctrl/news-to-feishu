@@ -15,6 +15,11 @@ on:
 permissions:
   contents: write
 
+# 防止"外部定时器"和"GitHub自带定时器"凑巧同时触发，导致同一天的复盘被推送两次
+concurrency:
+  group: lhb-push
+  cancel-in-progress: false
+
 jobs:
   push-lhb:
     runs-on: ubuntu-latest
@@ -40,6 +45,7 @@ jobs:
         run: |
           git config user.name "news-bot"
           git config user.email "news-bot@users.noreply.github.com"
+          git pull --rebase origin main || true
           git add lhb_sent.json || true
           git diff --cached --quiet || git commit -m "更新复盘推送记录 [skip ci]"
           git push || true
