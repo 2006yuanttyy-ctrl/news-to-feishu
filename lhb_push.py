@@ -23,7 +23,17 @@ except Exception as ex:
 STATE_FILE = "lhb_sent.json"  # 记录"今天有没有推送过"，避免重复推送
 FEISHU_WEBHOOK_LHB = os.environ.get("FEISHU_WEBHOOK_LHB", "").strip()
 
-TODAY = datetime.date.today()
+# 测试模式：如果设置了 TEST_DATE（格式 20260717），就用这个日期代替"今天"，
+# 并且跳过"周末跳过"和"今天已推送过"的限制，方便在非交易日验证数据抓取逻辑对不对。
+TEST_DATE = os.environ.get("TEST_DATE", "").strip()
+IS_TEST_MODE = bool(TEST_DATE)
+
+if IS_TEST_MODE:
+    TODAY = datetime.datetime.strptime(TEST_DATE, "%Y%m%d").date()
+    print(f"⚠️ 测试模式：使用指定日期 {TEST_DATE} 代替今天，不受周末/重复推送限制")
+else:
+    TODAY = datetime.date.today()
+
 TODAY_STR = TODAY.strftime("%Y%m%d")          # 例如 20260713，给 akshare 用
 TODAY_DISPLAY = TODAY.strftime("%Y年%m月%d日")  # 给消息展示用
 
@@ -174,12 +184,12 @@ def send_to_feishu(text):
 
 
 def main():
-    if not is_weekday():
+    if not IS_TEST_MODE and not is_weekday():
         print("今天是周末，跳过")
         return
 
     state = load_state()
-    if state.get("last_sent_date") == TODAY_STR:
+    if not IS_TEST_MODE and state.get("last_sent_date") == TODAY_STR:
         print("今天已经推送过复盘，跳过")
         return
 
