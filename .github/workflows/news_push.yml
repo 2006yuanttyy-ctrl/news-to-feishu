@@ -3,12 +3,19 @@ name: 财联社与头条新闻推送飞书
 on:
   schedule:
     # 每 5 分钟运行一次（UTC 时间，cron 不支持时区，5分钟一次足够及时）
+    # 注：GitHub 自带定时器实际会被平台自动降频，真正的触发频率以 cron-job.org 外部定时器配置为准
     - cron: "*/5 * * * *"
   workflow_dispatch: {}  # 允许你在 GitHub 网页上手动点一下立即运行，方便测试
 
 # 允许工作流把 seen.json 的更新提交回仓库
 permissions:
   contents: write
+
+# 防止"外部定时器"和"GitHub自带定时器"凑巧同时触发，导致同一条消息被推送两次：
+# 如果已经有一次在运行，新触发的会排队等待，而不是同时跑
+concurrency:
+  group: news-push
+  cancel-in-progress: false
 
 jobs:
   push-news:
@@ -34,6 +41,7 @@ jobs:
         run: |
           git config user.name "news-bot"
           git config user.email "news-bot@users.noreply.github.com"
+          git pull --rebase origin main || true
           git add seen.json || true
           git diff --cached --quiet || git commit -m "更新已推送记录 [skip ci]"
           git push || true
