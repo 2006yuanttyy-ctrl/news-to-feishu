@@ -42,13 +42,13 @@ jobs:
         env:
           FEISHU_WEBHOOK_LHB: ${{ secrets.FEISHU_WEBHOOK_LHB }}
           TEST_DATE: ${{ github.event.inputs.test_date }}
-        run: python lhb_push.py
+        run: python lhb_push.py 2>&1 | tee run_log.txt
 
-      - name: 保存今日已推送记录和PDF报告
+      - name: 保存今日已推送记录、PDF报告与运行日志
         run: |
           git config user.name "news-bot"
           git config user.email "news-bot@users.noreply.github.com"
           git pull --rebase origin main || true
-          git add lhb_sent.json reports/ || true
-          git diff --cached --quiet || git commit -m "更新复盘推送记录与PDF报告 [skip ci]"
+          git add lhb_sent.json reports/ run_log.txt || true
+          git diff --cached --quiet || git commit -m "更新复盘推送记录/PDF报告/运行日志 [skip ci]"
           git push || true
