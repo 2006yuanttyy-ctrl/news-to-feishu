@@ -1,0 +1,25 @@
+matplotlib 中文字体使用：Noto Sans CJK SC
+⚠️ 测试模式：使用指定日期 20260717 代替今天，不受周末/重复推送限制
+===== 开始抓取各模块数据 =====
+[1] 大盘概况...
+抓取上证指数失败：('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+抓取深证/创业板指数失败：('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+[1] 上证指数分时数据...
+抓取指数分时数据失败：('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+[1] 上证指数日K线数据...
+抓取指数日K线失败：('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+[2/3] 板块资金流向...
+抓取板块资金流失败：Expecting value: line 1 column 1 (char 0)
+[4] 机构龙虎榜...
+  0%|          | 0/1 [00:00<?, ?it/s]100%|██████████| 1/1 [00:00<00:00,  1.51it/s]                                             机构龙虎榜列名不符，实际列名：['序号', '代码', '名称', '收盘价', '涨跌幅', '买方机构数', '卖方机构数', '机构买入总额', '机构卖出总额', '机构买入净额', '市场总成交额', '机构净买额占总成交额比', '换手率', '流通市值', '上榜原因', '上榜日期']
+[附] 龙虎榜明细...
+  0%|          | 0/1 [00:00<?, ?it/s]100%|██████████| 1/1 [00:01<00:00,  1.18s/it]                                             [5] 连板情绪指标...
+[6] 明日关注板块...
+抓取行业板块列表失败：('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+抓取概念板块列表失败：('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+  0%|          | 0/5 [00:00<?, ?it/s] 20%|██        | 1/5 [00:01<00:07,  1.94s/it] 40%|████      | 2/5 [00:03<00:05,  1.87s/it] 60%|██████    | 3/5 [00:05<00:03,  1.91s/it]                                             抓取概念板块资金流失败：Expecting value: line 1 column 1 (char 0)
+===== 开始生成图表 =====
+===== 生成 PDF =====
+PDF 已生成：reports/fupan_20260717.pdf
+PDF 访问链接：https://raw.githubusercontent.com/2006yuanttyy-ctrl/news-to-feishu/main/reports/fupan_20260717.pdf
+推送成功
