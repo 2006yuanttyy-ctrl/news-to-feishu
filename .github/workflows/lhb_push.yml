@@ -36,7 +36,7 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq fonts-noto-cjk
 
       - name: 安装依赖
-        run: pip install akshare requests matplotlib reportlab
+        run: pip install akshare requests matplotlib reportlab mplfinance
 
       - name: 运行复盘推送脚本
         env:
