@@ -84,6 +84,73 @@ UP_COLOR = "#d9534f"    # 红涨
 DOWN_COLOR = "#5cb85c"  # 绿跌
 
 
+def retry_ak(func, *args, retries=3, delay=4, **kwargs):
+    """对 akshare 接口调用做重试，遇到连接被拒/超时等临时性错误时，
+    间隔几秒后再试，避免连续高频请求被数据源临时限流。"""
+    last_ex = None
+    for attempt in range(1, retries + 1):
+        try:
+            return func(*args, **kwargs)
+        except Exception as ex:
+            last_ex = ex
+            if attempt < retries:
+                print(f"    第{attempt}次调用 {func.__name__} 失败：{ex}，{delay}秒后重试...")
+                time.sleep(delay)
+    raise last_ex
+
+
+def pace():
+    """每个数据模块之间稍微歇一下，降低被数据源限流的概率"""
+    time.sleep(2)
+
+
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+
+
+def github_commit_file(local_path, repo_path, message):
+    """通过 GitHub API 把本地文件直接提交到仓库，返回是否成功。
+    比 git 命令行更可靠：能明确拿到成功/失败结果，不会静默失败。"""
+    if not GITHUB_TOKEN:
+        print(f"未配置 GITHUB_TOKEN，无法提交 {repo_path}")
+        return False
+
+    import base64
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{repo_path}"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+    }
+
+    with open(local_path, "rb") as f:
+        content_b64 = base64.b64encode(f.read()).decode()
+
+    sha = None
+    try:
+        r = requests.get(url, headers=headers, timeout=15)
+        if r.status_code == 200:
+            sha = r.json().get("sha")
+    except Exception as ex:
+        print(f"查询 {repo_path} 现有版本失败（可能是新文件，忽略）：{ex}")
+
+    payload = {"message": message, "content": content_b64, "branch": "main"}
+    if sha:
+        payload["sha"] = sha
+
+    for attempt in range(1, 4):
+        try:
+            r = requests.put(url, headers=headers, json=payload, timeout=30)
+            if r.status_code in (200, 201):
+                print(f"✔ 已提交 {repo_path}")
+                return True
+            else:
+                print(f"提交 {repo_path} 失败（第{attempt}次）：HTTP {r.status_code}，{r.text[:300]}")
+        except Exception as ex:
+            print(f"提交 {repo_path} 出错（第{attempt}次）：{ex}")
+        time.sleep(3)
+
+    return False
+
+
 # ========== 工具函数 ==========
 
 def load_seen_state():
@@ -128,7 +195,7 @@ def fetch_index_overview():
     result = {"indices": [], "total_amount": None, "zt_count": None, "dt_count": None}
 
     try:
-        sh_df = ak.stock_zh_index_spot_em(symbol="上证系列指数")
+        sh_df = retry_ak(ak.stock_zh_index_spot_em, symbol="上证系列指数")
         row = sh_df[sh_df["代码"] == "000001"]
         if not row.empty:
             r = row.iloc[0]
@@ -138,8 +205,10 @@ def fetch_index_overview():
     except Exception as ex:
         print(f"抓取上证指数失败：{ex}")
 
+    pace()
+
     try:
-        sz_df = ak.stock_zh_index_spot_em(symbol="深证系列指数")
+        sz_df = retry_ak(ak.stock_zh_index_spot_em, symbol="深证系列指数")
         for code, name in [("399001", "深证成指"), ("399006", "创业板指")]:
             row = sz_df[sz_df["代码"] == code]
             if not row.empty:
@@ -150,14 +219,18 @@ def fetch_index_overview():
     except Exception as ex:
         print(f"抓取深证/创业板指数失败：{ex}")
 
+    pace()
+
     try:
-        zt_df = ak.stock_zt_pool_em(date=TODAY_STR)
+        zt_df = retry_ak(ak.stock_zt_pool_em, date=TODAY_STR)
         result["zt_count"] = len(zt_df)
     except Exception as ex:
         print(f"抓取涨停家数失败：{ex}")
 
+    pace()
+
     try:
-        dt_df = ak.stock_zt_pool_dtgc_em(date=TODAY_STR)
+        dt_df = retry_ak(ak.stock_zt_pool_dtgc_em, date=TODAY_STR)
         result["dt_count"] = len(dt_df)
     except Exception as ex:
         print(f"抓取跌停家数失败：{ex}")
@@ -168,7 +241,8 @@ def fetch_index_overview():
 def fetch_index_intraday(symbol="000001"):
     """当日分时数据"""
     try:
-        df = ak.index_zh_a_hist_min_em(
+        df = retry_ak(
+            ak.index_zh_a_hist_min_em,
             symbol=symbol, period="1",
             start_date=f"{TODAY_STR} 09:00:00", end_date=f"{TODAY_STR} 15:30:00",
         )
@@ -185,7 +259,8 @@ def fetch_index_daily_k(symbol="000001", days=60):
     """近N个交易日的日K线数据"""
     try:
         start = TODAY - datetime.timedelta(days=int(days * 2.2) + 10)
-        df = ak.index_zh_a_hist(
+        df = retry_ak(
+            ak.index_zh_a_hist,
             symbol=symbol, period="daily",
             start_date=start.strftime("%Y%m%d"), end_date=TODAY_STR,
         )
@@ -291,7 +366,7 @@ def save_kline_chart(df, filepath, title="上证指数 近60日K线"):
 
 def fetch_sector_fund_flow(top_n=10):
     try:
-        df = ak.stock_sector_fund_flow_rank(indicator="今日", sector_type="行业资金流")
+        df = retry_ak(ak.stock_sector_fund_flow_rank, indicator="今日", sector_type="行业资金流")
     except Exception as ex:
         print(f"抓取板块资金流失败：{ex}")
         return None
@@ -325,7 +400,7 @@ def fetch_sector_fund_flow(top_n=10):
 
 def fetch_lhb_institution(top_n=10):
     try:
-        df = ak.stock_lhb_jgmmtj_em(start_date=TODAY_STR, end_date=TODAY_STR)
+        df = retry_ak(ak.stock_lhb_jgmmtj_em, start_date=TODAY_STR, end_date=TODAY_STR)
     except Exception as ex:
         print(f"抓取机构龙虎榜失败：{ex}")
         return None
@@ -335,7 +410,7 @@ def fetch_lhb_institution(top_n=10):
         return []
 
     net_col = None
-    for cand in ["机构净买额", "净买额"]:
+    for cand in ["机构买入净额", "机构净买额", "净买额"]:
         if cand in df.columns:
             net_col = cand
             break
@@ -370,7 +445,7 @@ def fetch_lhb_institution(top_n=10):
 
 def fetch_lhb_top(top_n=10):
     try:
-        df = ak.stock_lhb_detail_em(start_date=TODAY_STR, end_date=TODAY_STR)
+        df = retry_ak(ak.stock_lhb_detail_em, start_date=TODAY_STR, end_date=TODAY_STR)
     except Exception as ex:
         print(f"抓取龙虎榜数据失败：{ex}")
         return None
@@ -401,7 +476,7 @@ def fetch_lhb_top(top_n=10):
 
 def fetch_zt_streak():
     try:
-        df = ak.stock_zt_pool_em(date=TODAY_STR)
+        df = retry_ak(ak.stock_zt_pool_em, date=TODAY_STR)
     except Exception as ex:
         print(f"抓取连板信息失败：{ex}")
         return None
@@ -438,19 +513,23 @@ def fetch_zt_streak():
 
 def fetch_watch_sectors():
     try:
-        industry_df = ak.stock_board_industry_name_em()
+        industry_df = retry_ak(ak.stock_board_industry_name_em)
     except Exception as ex:
         print(f"抓取行业板块列表失败：{ex}")
         industry_df = None
 
+    pace()
+
     try:
-        concept_df = ak.stock_board_concept_name_em()
+        concept_df = retry_ak(ak.stock_board_concept_name_em)
     except Exception as ex:
         print(f"抓取概念板块列表失败：{ex}")
         concept_df = None
 
+    pace()
+
     try:
-        concept_flow_df = ak.stock_sector_fund_flow_rank(indicator="今日", sector_type="概念资金流")
+        concept_flow_df = retry_ak(ak.stock_sector_fund_flow_rank, indicator="今日", sector_type="概念资金流")
     except Exception as ex:
         print(f"抓取概念板块资金流失败：{ex}")
         concept_flow_df = None
@@ -796,23 +875,37 @@ def main():
     print("[1] 大盘概况...")
     overview = fetch_index_overview()
 
+    pace()
+
     print("[1] 上证指数分时数据...")
     intraday_df = fetch_index_intraday(symbol="000001")
+
+    pace()
 
     print("[1] 上证指数日K线数据...")
     kline_df = fetch_index_daily_k(symbol="000001", days=60)
 
+    pace()
+
     print("[2/3] 板块资金流向...")
     sector_flow = fetch_sector_fund_flow()
+
+    pace()
 
     print("[4] 机构龙虎榜...")
     lhb_inst = fetch_lhb_institution()
 
+    pace()
+
     print("[附] 龙虎榜明细...")
     lhb_detail = fetch_lhb_top()
 
+    pace()
+
     print("[5] 连板情绪指标...")
     zt_streak = fetch_zt_streak()
+
+    pace()
 
     print("[6] 明日关注板块...")
     watch_sectors = fetch_watch_sectors()
@@ -858,17 +951,26 @@ def main():
         "watch_sectors": watch_sectors,
     }
     build_pdf(pdf_path, data, chart_paths)
-    print(f"PDF 已生成：{pdf_path}")
+    print(f"PDF 已在本地生成：{pdf_path}")
+
+    print("===== 提交 PDF 到 GitHub 仓库 =====")
+    committed = github_commit_file(
+        pdf_path, pdf_path, f"自动生成 {TODAY_DISPLAY} 复盘PDF报告 [skip ci]"
+    )
+    if not committed:
+        print("⚠️ PDF 提交仓库失败！为避免飞书推送一个打不开的链接，本次不发送消息，等下次自动重试。")
+        return
 
     pdf_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{REPORTS_DIR}/{pdf_filename}"
     print(f"PDF 访问链接：{pdf_url}")
 
     ok = send_summary_card(overview, lhb_detail, zt_streak, watch_sectors, pdf_url)
     if ok:
+        print("推送成功")
         if not IS_TEST_MODE:
             state["last_sent_date"] = TODAY_STR
             save_seen_state(state)
-        print("推送成功")
+            github_commit_file(STATE_FILE, STATE_FILE, f"更新复盘推送记录 {TODAY_STR} [skip ci]")
     else:
         print("推送失败，不记录，等下次自动重试")
 
