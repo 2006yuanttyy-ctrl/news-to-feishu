@@ -1,3 +1,2 @@
-Matplotlib is building the font cache; this may take a moment.
 matplotlib 中文字体使用：Noto Sans CJK SC
 今天已经推送过复盘，跳过
