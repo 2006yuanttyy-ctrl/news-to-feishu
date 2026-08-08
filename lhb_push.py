@@ -1064,34 +1064,47 @@ def send_summary_card(overview, lhb_detail, zt_streak, watch_sectors, pdf_url):
     # 注：板块资金流数据通过闭包从 main() 传入更干净，这里保持接口稳定只展示其他模块
     # 如果上层想传 sector_flow，可改签名；本次保守不动签名
 
-    # ---- 模块 5：龙虎榜净买入 TOP3（含涨跌幅） ----
+    # ---- 模块 5：龙虎榜净买入 TOP10（v2 兼容版：分 4 组三栏卡片，避免 5 列表挤压） ----
     if lhb_detail:
         elements.append({"tag": "hr"})
         elements.append({
             "tag": "div",
-            "text": {"tag": "lark_md", "content": "**🏆 龙虎榜净买入 TOP3**"},
+            "text": {"tag": "lark_md", "content": "**🏆 龙虎榜净买入 TOP10（按净额排序）**"},
         })
-        lhb_lines = []
-        for item in lhb_detail[:3]:
-            pct_str = _color_pct(item.get("pct"))
-            amt_str = _color_amt(item.get("net_buy"))
-            lhb_lines.append(
-                f"  {item['name']}（{item['code']}）"
-                f"　净买入 {amt_str}　|　涨幅 {pct_str}"
-            )
-        elements.append({
-            "tag": "div",
-            "text": {"tag": "lark_md", "content": "\n".join(lhb_lines)},
-        })
+        # 关键改动：拆成 4 个三栏卡片（10 行 → 4 组），避开 5 列 column_set 在手机端挤压
+        top10 = lhb_detail[:10]
+        groups = [top10[i:i+3] for i in range(0, len(top10), 3)]
+        for g_idx, group in enumerate(groups):
+            col_items = []
+            for item in group:
+                pct_str = _color_pct(item.get("pct"))
+                side = item.get("side", "买入")
+                side_color = "green" if side == "买入" else "red"
+                amt_yi = item.get("net_buy_yi") or item.get("amount_yi")
+                amt_str = fmt_amount_yi(amt_yi) if amt_yi else "N/A"
+                col_items.append({
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 1,
+                    "elements": [
+                        {"tag": "div", "text": {"tag": "lark_md",
+                            "content": f"**{item['name']}**　<font color='grey'>{item['code']}</font>"}},
+                        {"tag": "div", "text": {"tag": "lark_md",
+                            "content": f"<font color='{side_color}'>**{side}**</font>　{amt_str}"}},
+                        {"tag": "div", "text": {"tag": "lark_md", "content": pct_str}},
+                    ],
+                })
+            elements.append({"tag": "column_set", "flex_mode": "stretch", "columns": col_items})
+            if g_idx < len(groups) - 1:
+                elements.append({"tag": "hr"})
 
-    # ---- 模块 6：明日关注（带方向箭头） ----
+    # ---- 模块 6：明日关注（v2 兼容版：改用多个 div 避免 \n） ----
     if watch_sectors:
         elements.append({"tag": "hr"})
         elements.append({
             "tag": "div",
             "text": {"tag": "lark_md", "content": "**🎯 明日关注**"},
         })
-        watch_lines = []
         for w in watch_sectors:
             pct_val = None
             try:
@@ -1100,18 +1113,18 @@ def send_summary_card(overview, lhb_detail, zt_streak, watch_sectors, pdf_url):
                 pass
             if pct_val is not None:
                 arrow = "▲" if pct_val > 0 else ("▼" if pct_val < 0 else "—")
-                pct_str = f"<font color='{'green' if pct_val > 0 else 'red' if pct_val < 0 else 'grey'}'>{arrow} {pct_val:+.2f}%</font>"
+                pct_str = f"<font color='{'green' if pct_val > 0 else 'red' if pct_val < 0 else 'grey'}'>**{arrow} {pct_val:+.2f}%**</font>"
             else:
                 pct_str = "N/A"
             tag_legend = {"🔴": "强趋势", "🟡": "观察", "🟢": "风险"}.get(w["tag"], "")
-            watch_lines.append(
-                f"  {w['tag']} **{w['keyword']}**　{pct_str}"
+            line = (
+                f"• {w['tag']} **{w['keyword']}**　{pct_str}"
                 + (f"　<font color='grey'>· {tag_legend}</font>" if tag_legend else "")
             )
-        elements.append({
-            "tag": "div",
-            "text": {"tag": "lark_md", "content": "\n".join(watch_lines)},
-        })
+            elements.append({
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": line},
+            })
 
     # ---- 模块 7：风险提示 + 跳转按钮 ----
     elements.append({"tag": "hr"})
