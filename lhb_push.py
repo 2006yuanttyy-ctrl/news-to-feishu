@@ -512,6 +512,33 @@ def fetch_zt_streak():
 
 # ========== 六、明日关注板块 ==========
 
+def fetch_sector_change(top_n=5):
+    """抓取行业板块涨跌幅榜（v3 卡片用）—— 取涨幅 TOP N + 跌幅 TOP N
+    返回 {"up": [(name, pct), ...], "down": [(name, pct), ...]}
+    注：复用 ak.stock_board_industry_name_em（与 watch_sectors 同源，不重复请求）
+    """
+    try:
+        df = retry_ak(ak.stock_board_industry_name_em)
+    except Exception as ex:
+        print(f"抓取板块涨跌幅榜失败：{ex}")
+        return None
+    if df is None or df.empty:
+        return None
+    name_col = "板块名称" if "板块名称" in df.columns else df.columns[1]
+    pct_col = "涨跌幅" if "涨跌幅" in df.columns else None
+    if pct_col is None:
+        print(f"板块涨跌幅榜缺涨跌幅列：{list(df.columns)}")
+        return None
+    try:
+        df_sorted = df.copy()
+        df_sorted[pct_col] = df_sorted[pct_col].astype(float)
+    except Exception:
+        return None
+    up = df_sorted.sort_values(pct_col, ascending=False).head(top_n)[[name_col, pct_col]].values.tolist()
+    down = df_sorted.sort_values(pct_col, ascending=True).head(top_n)[[name_col, pct_col]].values.tolist()
+    return {"up": up, "down": down}
+
+
 def fetch_watch_sectors():
     try:
         industry_df = retry_ak(ak.stock_board_industry_name_em)
@@ -920,47 +947,63 @@ def build_pdf(pdf_path, data, chart_paths):
 
 # ========== 飞书推送 ==========
 
-def send_summary_card(overview, lhb_detail, zt_streak, watch_sectors, pdf_url):
-    """飞书卡片推送（保守稳重版 · 深蓝/灰配色）
-    视觉结构：
-      - header：深蓝底白字标题
-      - column_set：三大指数分卡片（每个独立卡片，左色条）
-      - 一行市场情绪摘要
-      - 模块化分隔（hr + 模块标题）
-      - 底部"查看PDF"按钮
+def send_summary_card(overview, lhb_detail, zt_streak, watch_sectors, sector_flow, sector_chg, pdf_url):
+    """飞书卡片推送 v3 · 涨红跌绿 + 极致紧凑单卡
+    视觉结构（单卡顺序）：
+      ① header：深蓝底白字标题
+      ② 一行：盘面一句话总结（直接跟在 header 后面，无 hr）
+      ③ 一行：三大指数（上证/深证/创板，三列横排）
+      ④ 一行：成交额 · 涨停(红) · 跌停(绿) · 连板
+      ⑤ 一行：板块涨跌幅 TOP3(红) / 跌 TOP3(绿)  ← 新增
+      ⑥ 板块资金净流入 TOP3 + 净流出 TOP3（两列）    ← 新增
+      ⑦ 龙虎榜净买入 TOP5（5 列紧凑）
+      ⑧ 明日关注（横排 chips）
+      ⑨ 底部：风险提示 + PDF 按钮
+    设计要点：
+      - A 股惯例：涨红跌绿（v2 是反的，已修正）
+      - 极致紧凑：删除中间 hr 改用 section title + 留白
+      - 板块信息：涨跌幅榜 + 资金流双视角
     """
     if not FEISHU_WEBHOOK_LHB:
         print("未配置 FEISHU_WEBHOOK_LHB，跳过推送")
         return False
 
-    # ========== 主题色（保守稳重：深蓝主调 + 中性灰） ==========
+    # ========== 主题色（A 股惯例：涨红跌绿） ==========
     COLOR_HEADER = "blue"            # 飞书内置蓝色模板
-    COLOR_UP_TAG = "green"           # 涨用绿 tag（A股惯例）
-    COLOR_DOWN_TAG = "red"
-    COLOR_NEUTRAL_TAG = "grey"
+    COLOR_UP = "red"                 # ← v3 修正：涨=红（A 股惯例）
+    COLOR_DOWN = "green"             # ← v3 修正：跌=绿
+    COLOR_NEUTRAL = "grey"
 
     # ========== 工具：给数字加颜色 ==========
     def _color_pct(pct_val):
+        """返回带颜色的百分比字符串"""
         try:
             v = float(pct_val)
         except Exception:
             return "N/A"
         if v > 0:
-            return f"<font color='green'>**+{v:.2f}%**</font>"
+            return f"<font color='{COLOR_UP}'>**+{v:.2f}%**</font>"      # 涨红
         if v < 0:
-            return f"<font color='red'>**{v:.2f}%**</font>"
+            return f"<font color='{COLOR_DOWN}'>**{v:.2f}%**</font>"    # 跌绿
         return f"{v:.2f}%"
 
     def _color_amt(v):
+        """返回带颜色的金额字符串"""
         try:
             x = float(v)
         except Exception:
             return "N/A"
         if x > 0:
-            return f"<font color='green'>{fmt_amount_yi(x)}</font>"
+            return f"<font color='{COLOR_UP}'>{fmt_amount_yi(x)}</font>"  # 流入红
         if x < 0:
-            return f"<font color='red'>{fmt_amount_yi(x)}</font>"
+            return f"<font color='{COLOR_DOWN}'>{fmt_amount_yi(x)}</font>"  # 流出绿
         return fmt_amount_yi(x)
+
+    def _color_num(v, color):
+        """纯数字着色（用于涨停/跌停家数等计数）"""
+        if v is None:
+            return "N/A"
+        return f"<font color='{color}'>**{v}**</font>"
 
     # ========== 市场一句话总结（规则引擎） ==========
     def _summarize(ov, zt_stk):
@@ -997,55 +1040,49 @@ def send_summary_card(overview, lhb_detail, zt_streak, watch_sectors, pdf_url):
         bits = [b for b in [trend, mood] if b]
         return " ｜ ".join(bits) if bits else "（数据不足，暂不评价）"
 
-    # ========== 组装卡片的 elements 列表 ==========
+    # ========== 组装卡片的 elements 列表（v3 · 极致紧凑） ==========
     elements = []
 
-    # ---- 模块 1：市场一句话总结 ----
+    # ---- 模块 ① 盘面一句话总结（紧跟 header，无 hr） ----
     summary_text = _summarize(overview, zt_streak)
     elements.append({
         "tag": "div",
         "text": {
             "tag": "lark_md",
-            "content": f"**盘面总览**　{summary_text}",
+            "content": f"**盘面**　{summary_text}",
         },
     })
-    elements.append({"tag": "hr"})
 
-    # ---- 模块 2：三大指数（column_set 分卡片） ----
+    # ---- 模块 ② 三大指数（横向一行，三列等分） ----
     indices = overview.get("indices", [])
     if indices:
-        elements.append({
-            "tag": "div",
-            "text": {"tag": "lark_md", "content": "**📊 三大指数**"},
-        })
         col_items = []
         for name, price, pct in indices:
-            tag_color = COLOR_UP_TAG if pct > 0 else (COLOR_DOWN_TAG if pct < 0 else COLOR_NEUTRAL_TAG)
             arrow = "▲" if pct > 0 else ("▼" if pct < 0 else "—")
+            pct_str = _color_pct(pct)
             col_items.append({
                 "tag": "column",
                 "width": "weighted",
                 "weight": 1,
                 "elements": [
-                    {"tag": "div", "text": {"tag": "lark_md", "content": f"**{name}**"}},
+                    {"tag": "div", "text": {"tag": "lark_md", "content": f"**{name}**　<font color='grey'>{price:.2f}</font>"}},
                     {"tag": "div", "text": {"tag": "lark_md",
-                        "content": f"<font color='grey'>{price:.2f}</font>"}},
-                    {"tag": "div", "text": {"tag": "lark_md",
-                        "content": f"<font color='{'green' if pct > 0 else 'red' if pct < 0 else 'grey'}'>**{arrow} {pct:+.2f}%**</font>"}},
+                        "content": f"{arrow}　{pct_str}"}},
                 ],
             })
         elements.append({"tag": "column_set", "flex_mode": "stretch", "columns": col_items})
 
-    # ---- 模块 3：成交额 / 涨跌停家数 / 连板（横向一行） ----
+    # ---- 模块 ③ 成交额 · 涨停 · 跌停 · 连板（紧贴指数，单行） ----
     metric_bits = []
     if overview.get("total_amount"):
-        metric_bits.append(f"**成交额**　{fmt_amount_yi(overview['total_amount'])}元")
+        metric_bits.append(f"**成交额**　{fmt_amount_yi(overview['total_amount'])}亿")
     if overview.get("zt_count") is not None:
-        metric_bits.append(f"**涨停**　<font color='red'>{overview['zt_count']}</font> 家")
+        # v3：涨停=红（用户要求）
+        metric_bits.append(f"**涨停**　{_color_num(overview['zt_count'], COLOR_UP)}家")
     if overview.get("dt_count") is not None:
-        metric_bits.append(f"**跌停**　<font color='green'>{overview['dt_count']}</font> 家")
+        # v3：跌停=绿（用户要求）
+        metric_bits.append(f"**跌停**　{_color_num(overview['dt_count'], COLOR_DOWN)}家")
     if metric_bits:
-        elements.append({"tag": "hr"})
         elements.append({
             "tag": "div",
             "text": {"tag": "lark_md", "content": "　".join(metric_bits)},
@@ -1056,75 +1093,121 @@ def send_summary_card(overview, lhb_detail, zt_streak, watch_sectors, pdf_url):
         elements.append({
             "tag": "div",
             "text": {"tag": "lark_md",
-                "content": f"**⚡ 最高连板**　<font color='orange'>{zt_streak['max_streak']}</font> 板 · {names}"},
+                "content": f"**⚡ 连板王**　<font color='orange'>{zt_streak['max_streak']}</font>板 · {names}"},
         })
 
-    # ---- 模块 4：资金动向（板块流入/流出TOP3） ----
-    sector_flow = None  # 主流程已经把 sector_flow 注入 data，但这里函数签名没接收，我们从 data 全局取
-    # 注：板块资金流数据通过闭包从 main() 传入更干净，这里保持接口稳定只展示其他模块
-    # 如果上层想传 sector_flow，可改签名；本次保守不动签名
+    # ---- 模块 ④ 板块涨跌幅 TOP5（v3 新增 · 涨红跌绿一行对照） ----
+    if sector_chg:
+        up_top = sector_chg.get("up", [])[:5]
+        dn_top = sector_chg.get("down", [])[:5]
+        if up_top or dn_top:
+            up_text = " · ".join(
+                f"{_color_pct(item[1])}　<font color='grey'>{item[0]}</font>"
+                for item in up_top
+            )
+            dn_text = " · ".join(
+                f"{_color_pct(item[1])}　<font color='grey'>{item[0]}</font>"
+                for item in dn_top
+            )
+            elements.append({"tag": "hr"})
+            sector_md_parts = []
+            if up_top:
+                sector_md_parts.append(f"<font color='{COLOR_UP}'>**领涨**</font>　{up_text}")
+            if dn_top:
+                sector_md_parts.append(f"<font color='{COLOR_DOWN}'>**领跌**</font>　{dn_text}")
+            elements.append({
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": "\n".join(sector_md_parts)},
+            })
 
-    # ---- 模块 5：龙虎榜净买入 TOP10（v2 兼容版：分 4 组三栏卡片，避免 5 列表挤压） ----
+    # ---- 模块 ⑤ 板块资金流向（v3 新增 · 双列对照） ----
+    if sector_flow and (sector_flow.get("inflow") or sector_flow.get("outflow")):
+        elements.append({"tag": "hr"})
+        inflow_top = sector_flow.get("inflow", [])[:3]
+        outflow_top = sector_flow.get("outflow", [])[:3]
+        inflow_lines = []
+        for name, amt in inflow_top:
+            inflow_lines.append(
+                f"<font color='{COLOR_UP}'>**{fmt_amount_yi(amt)}**</font>　{name}"
+            )
+        outflow_lines = []
+        for name, amt in outflow_top:
+            outflow_lines.append(
+                f"<font color='{COLOR_DOWN}'>**{fmt_amount_yi(amt)}**</font>　{name}"
+            )
+        col_items = []
+        if inflow_lines:
+            col_items.append({
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "elements": [{
+                    "tag": "div",
+                    "text": {"tag": "lark_md",
+                        "content": f"**💰 资金流入**\n" + "\n".join(inflow_lines)},
+                }],
+            })
+        if outflow_lines:
+            col_items.append({
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "elements": [{
+                    "tag": "div",
+                    "text": {"tag": "lark_md",
+                        "content": f"**💸 资金流出**\n" + "\n".join(outflow_lines)},
+                }],
+            })
+        if col_items:
+            elements.append({"tag": "column_set", "flex_mode": "stretch", "columns": col_items})
+
+    # ---- 模块 ⑥ 龙虎榜净买入 TOP10（v3 紧凑版：分 2 组五行，去掉中间 hr） ----
     if lhb_detail:
         elements.append({"tag": "hr"})
         elements.append({
             "tag": "div",
-            "text": {"tag": "lark_md", "content": "**🏆 龙虎榜净买入 TOP10（按净额排序）**"},
+            "text": {"tag": "lark_md", "content": "**🏆 龙虎榜净买入 TOP10**"},
         })
-        # 关键改动：拆成 4 个三栏卡片（10 行 → 4 组），避开 5 列 column_set 在手机端挤压
+        # v3 改：分 2 组 5 列（原 4 组 3 列），每组是 5 个等宽列
         top10 = lhb_detail[:10]
-        groups = [top10[i:i+3] for i in range(0, len(top10), 3)]
+        groups = [top10[i:i+5] for i in range(0, len(top10), 5)]
         for g_idx, group in enumerate(groups):
             col_items = []
             for item in group:
-                pct_str = _color_pct(item.get("pct"))
-                side = item.get("side", "买入")
-                side_color = "green" if side == "买入" else "red"
+                # 净买 = 红，净卖 = 绿
                 amt_yi = item.get("net_buy_yi") or item.get("amount_yi")
                 amt_str = fmt_amount_yi(amt_yi) if amt_yi else "N/A"
+                amt_color = COLOR_UP if (amt_yi and amt_yi > 0) else COLOR_DOWN
                 col_items.append({
                     "tag": "column",
                     "width": "weighted",
                     "weight": 1,
                     "elements": [
                         {"tag": "div", "text": {"tag": "lark_md",
-                            "content": f"**{item['name']}**　<font color='grey'>{item['code']}</font>"}},
+                            "content": f"**{item['name']}**"}},
                         {"tag": "div", "text": {"tag": "lark_md",
-                            "content": f"<font color='{side_color}'>**{side}**</font>　{amt_str}"}},
-                        {"tag": "div", "text": {"tag": "lark_md", "content": pct_str}},
+                            "content": f"<font color='{amt_color}'>{amt_str}</font>"}},
                     ],
                 })
             elements.append({"tag": "column_set", "flex_mode": "stretch", "columns": col_items})
-            if g_idx < len(groups) - 1:
-                elements.append({"tag": "hr"})
 
-    # ---- 模块 6：明日关注（v2 兼容版：改用多个 div 避免 \n） ----
+    # ---- 模块 ⑦ 明日关注（v3 紧凑版：单行 div 横向拼接） ----
     if watch_sectors:
         elements.append({"tag": "hr"})
-        elements.append({
-            "tag": "div",
-            "text": {"tag": "lark_md", "content": "**🎯 明日关注**"},
-        })
+        watch_bits = []
         for w in watch_sectors:
             pct_val = None
             try:
                 pct_val = float(w["pct"]) if w["pct"] is not None else None
             except Exception:
                 pass
-            if pct_val is not None:
-                arrow = "▲" if pct_val > 0 else ("▼" if pct_val < 0 else "—")
-                pct_str = f"<font color='{'green' if pct_val > 0 else 'red' if pct_val < 0 else 'grey'}'>**{arrow} {pct_val:+.2f}%**</font>"
-            else:
-                pct_str = "N/A"
-            tag_legend = {"🔴": "强趋势", "🟡": "观察", "🟢": "风险"}.get(w["tag"], "")
-            line = (
-                f"• {w['tag']} **{w['keyword']}**　{pct_str}"
-                + (f"　<font color='grey'>· {tag_legend}</font>" if tag_legend else "")
-            )
-            elements.append({
-                "tag": "div",
-                "text": {"tag": "lark_md", "content": line},
-            })
+            pct_str = _color_pct(pct_val) if pct_val is not None else "N/A"
+            watch_bits.append(f"{w['tag']} **{w['keyword']}**　{pct_str}")
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md",
+                "content": "**🎯 明日关注**　" + " ｜ ".join(watch_bits)},
+        })
 
     # ---- 模块 7：风险提示 + 跳转按钮 ----
     elements.append({"tag": "hr"})
@@ -1350,6 +1433,9 @@ def main():
     print("[6] 明日关注板块...")
     watch_sectors = fetch_watch_sectors()
 
+    print("[6.1] 板块涨跌幅榜...")
+    sector_chg = fetch_sector_change()
+
     if lhb_detail is None:
         print("龙虎榜明细抓取失败（网络或接口问题），本次不推送，等下次自动重试")
         return
@@ -1404,7 +1490,7 @@ def main():
     pdf_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{REPORTS_DIR}/{pdf_filename}"
     print(f"PDF 访问链接：{pdf_url}")
 
-    ok = send_summary_card(overview, lhb_detail, zt_streak, watch_sectors, pdf_url)
+    ok = send_summary_card(overview, lhb_detail, zt_streak, watch_sectors, sector_flow, sector_chg, pdf_url)
     if ok:
         print("推送成功")
         if not IS_TEST_MODE:
