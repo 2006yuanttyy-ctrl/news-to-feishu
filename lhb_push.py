@@ -35,6 +35,7 @@ from reportlab.platypus import (
 )
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
 
 try:
     import akshare as ak
@@ -615,6 +616,12 @@ def save_bar_chart_h(pairs, title, filepath, unit=""):
 # ========== PDF 组装 ==========
 
 def build_pdf(pdf_path, data, chart_paths):
+    """PDF 报告生成（保守稳重版 · 深蓝主题）
+    结构：
+      - 封面页：日期 + 报告标题 + 一句话总结 + 关键指标
+      - 正文：六章节 + 附录（每章首页有蓝色分隔条）
+      - 页眉/页脚：日期 / 页码 / 免责声明
+    """
     overview = data["overview"]
     sector_flow = data["sector_flow"]
     lhb_inst = data["lhb_inst"]
@@ -622,26 +629,149 @@ def build_pdf(pdf_path, data, chart_paths):
     zt_streak = data["zt_streak"]
     watch_sectors = data["watch_sectors"]
 
+    # ========== 主题色（与飞书卡片对齐） ==========
+    PRIMARY = colors.HexColor("#1a3d7c")    # 深蓝（标题栏/页眉）
+    PRIMARY_LIGHT = colors.HexColor("#e8eef7")  # 浅蓝（斑马纹/标签底）
+    GREY_LIGHT = colors.HexColor("#f2f2f2")
+    GREY_MID = colors.HexColor("#888888")
+    UP = colors.HexColor("#c00000")           # 红涨
+    DOWN = colors.HexColor("#2e7d32")         # 绿跌
+
+    # ========== 样式定义 ==========
     styles = getSampleStyleSheet()
     for name in ["Normal", "Heading1", "Heading2", "Title"]:
         styles[name].fontName = "STSong-Light"
 
-    title_style = ParagraphStyle("cn_title", parent=styles["Title"], fontName="STSong-Light", fontSize=20)
-    h2_style = ParagraphStyle("cn_h2", parent=styles["Heading2"], fontName="STSong-Light", fontSize=14,
-                                spaceBefore=14, spaceAfter=8, textColor=colors.HexColor("#1a3d7c"))
-    body_style = ParagraphStyle("cn_body", parent=styles["Normal"], fontName="STSong-Light", fontSize=10, leading=15)
-    small_style = ParagraphStyle("cn_small", parent=styles["Normal"], fontName="STSong-Light", fontSize=9, leading=13)
+    title_style = ParagraphStyle(
+        "cn_title", parent=styles["Title"], fontName="STSong-Light",
+        fontSize=28, leading=34, alignment=TA_CENTER, textColor=PRIMARY,
+        spaceAfter=20,
+    )
+    cover_sub_style = ParagraphStyle(
+        "cover_sub", parent=styles["Normal"], fontName="STSong-Light",
+        fontSize=14, leading=22, alignment=TA_CENTER, textColor=GREY_MID,
+        spaceAfter=30,
+    )
+    cover_summary_style = ParagraphStyle(
+        "cover_summary", parent=styles["Normal"], fontName="STSong-Light",
+        fontSize=12, leading=20, alignment=TA_CENTER, textColor=colors.black,
+        spaceAfter=10,
+    )
+    h1_style = ParagraphStyle(
+        "cn_h1", parent=styles["Heading1"], fontName="STSong-Light",
+        fontSize=18, leading=24, textColor=colors.white,
+        backColor=PRIMARY, borderPadding=8, leftIndent=0, spaceBefore=4, spaceAfter=12,
+    )
+    h2_style = ParagraphStyle(
+        "cn_h2", parent=styles["Heading2"], fontName="STSong-Light",
+        fontSize=14, spaceBefore=12, spaceAfter=8, textColor=PRIMARY,
+    )
+    body_style = ParagraphStyle(
+        "cn_body", parent=styles["Normal"], fontName="STSong-Light",
+        fontSize=10, leading=15,
+    )
+    body_bold_style = ParagraphStyle(
+        "cn_body_bold", parent=body_style, fontName="STSong-Light",
+        fontSize=10, leading=15,
+    )
+    small_style = ParagraphStyle(
+        "cn_small", parent=styles["Normal"], fontName="STSong-Light",
+        fontSize=9, leading=13, textColor=colors.HexColor("#555555"),
+    )
+    footer_style = ParagraphStyle(
+        "footer", parent=body_style, fontSize=8, textColor=GREY_MID,
+        alignment=TA_CENTER,
+    )
+    note_style = ParagraphStyle(
+        "note", parent=body_style, fontSize=9, textColor=GREY_MID,
+        backColor=PRIMARY_LIGHT, borderPadding=6, leftIndent=4, rightIndent=4,
+    )
 
-    doc = SimpleDocTemplate(pdf_path, pagesize=A4,
-                             topMargin=1.5 * cm, bottomMargin=1.5 * cm,
-                             leftMargin=1.8 * cm, rightMargin=1.8 * cm)
+    # ========== 页眉/页脚回调 ==========
+    def _header_footer(canvas, doc):
+        canvas.saveState()
+        # 页眉：左侧日期，右侧项目名
+        canvas.setFont("STSong-Light", 9)
+        canvas.setFillColor(GREY_MID)
+        canvas.drawString(1.8 * cm, A4[1] - 1.0 * cm, f"📊 收盘复盘报告 · {TODAY_DISPLAY}")
+        canvas.drawRightString(A4[0] - 1.8 * cm, A4[1] - 1.0 * cm, "新闻→飞书 自动播报")
+        # 顶部分隔线
+        canvas.setStrokeColor(PRIMARY)
+        canvas.setLineWidth(1.2)
+        canvas.line(1.8 * cm, A4[1] - 1.2 * cm, A4[0] - 1.8 * cm, A4[1] - 1.2 * cm)
+        # 页脚：左侧免责声明，右侧页码
+        canvas.setFont("STSong-Light", 8)
+        canvas.setFillColor(GREY_MID)
+        canvas.drawString(1.8 * cm, 1.0 * cm, "数据来源：东方财富（akshare），仅供参考，不构成投资建议。")
+        canvas.drawRightString(A4[0] - 1.8 * cm, 1.0 * cm, f"第 {doc.page} 页")
+        canvas.restoreState()
+
+    doc = SimpleDocTemplate(
+        pdf_path, pagesize=A4,
+        topMargin=1.8 * cm, bottomMargin=1.8 * cm,
+        leftMargin=1.8 * cm, rightMargin=1.8 * cm,
+        title=f"{TODAY_DISPLAY} 收盘复盘报告",
+        author="新闻→飞书 自动播报系统",
+    )
     story = []
 
-    story.append(Paragraph(f"{TODAY_DISPLAY} 收盘复盘报告", title_style))
-    story.append(Spacer(1, 0.5 * cm))
+    # ========== 封面页 ==========
+    story.append(Spacer(1, 4 * cm))
+    story.append(Paragraph(f"{TODAY_DISPLAY}", cover_sub_style))
+    story.append(Paragraph("收 盘 复 盘 报 告", title_style))
+    story.append(Paragraph("新闻 → 飞书 · 自动播报系统", cover_sub_style))
+    story.append(Spacer(1, 1 * cm))
+
+    # 封面摘要表：核心指标
+    cover_kvs = []
+    if overview.get("indices"):
+        for name, price, pct in overview["indices"]:
+            arrow = "▲" if pct > 0 else ("▼" if pct < 0 else "—")
+            color_hex = "#c00000" if pct > 0 else ("#2e7d32" if pct < 0 else "#888888")
+            cover_kvs.append([
+                name,
+                f"{price:.2f}",
+                f'<font color="{color_hex}"><b>{arrow} {pct:+.2f}%</b></font>',
+            ])
+    if overview.get("zt_count") is not None:
+        cover_kvs.append(["涨停家数", f'<font color="#c00000"><b>{overview["zt_count"]}</b></font>', "家"])
+    if overview.get("dt_count") is not None:
+        cover_kvs.append(["跌停家数", f'<font color="#2e7d32"><b>{overview["dt_count"]}</b></font>', "家"])
+    if overview.get("total_amount"):
+        cover_kvs.append(["两市成交额", f"{fmt_amount_yi(overview['total_amount'])}", "元"])
+    if zt_streak and zt_streak.get("stocks"):
+        names = "、".join(n for n, _ in zt_streak["stocks"][:3])
+        cover_kvs.append(["最高连板", f"{zt_streak['max_streak']} 板", names])
+
+    if cover_kvs:
+        cover_tbl = Table(
+            [[Paragraph(str(c), ParagraphStyle("kv", parent=body_style,
+                  alignment=TA_CENTER if i > 0 else TA_LEFT,
+                  fontSize=11, leading=16)) for i, c in enumerate(row)] for row in cover_kvs],
+            colWidths=[4 * cm, 5 * cm, 6.5 * cm],
+        )
+        cover_tbl.setStyle(TableStyle([
+            ("FONTNAME", (0, 0), (-1, -1), "STSong-Light"),
+            ("BACKGROUND", (0, 0), (-1, -1), PRIMARY_LIGHT),
+            ("LINEBELOW", (0, 0), (-1, -1), 0.5, colors.white),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, -1), 8),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+            ("LEFTPADDING", (0, 0), (-1, -1), 10),
+        ]))
+        story.append(cover_tbl)
+
+    story.append(Spacer(1, 2 * cm))
+    story.append(Paragraph(
+        "本报告由 lhb_push.py 自动生成，涵盖市场总览、资金动向、龙虎榜、情绪指标及明日关注，"
+        "数据来源于东方财富公开接口（akshare）。本报告仅供研究参考，"
+        "不构成任何投资建议；市场有风险，投资需谨慎。",
+        note_style,
+    ))
+    story.append(PageBreak())
 
     # ---- 一、市场总览 ----
-    story.append(Paragraph("一、市场总览", h2_style))
+    story.append(Paragraph("一、市场总览", h1_style))
     if overview["indices"]:
         idx_text = "　".join(f"{n} {p:.2f}（{fmt_pct(c)}）" for n, p, c in overview["indices"])
         story.append(Paragraph(idx_text, body_style))
@@ -667,14 +797,15 @@ def build_pdf(pdf_path, data, chart_paths):
     story.append(PageBreak())
 
     # ---- 二/三、资金进攻/撤退方向 ----
-    story.append(Paragraph("二、资金进攻方向（板块净流入前十）", h2_style))
+    story.append(Paragraph("二、资金进攻方向（板块净流入前十）", h1_style))
     if sector_flow and chart_paths.get("sector_inflow"):
         story.append(Image(chart_paths["sector_inflow"], width=15 * cm,
                              height=0.6 * cm * len(sector_flow["inflow"]) + 2 * cm))
     else:
         story.append(Paragraph("（本节数据暂缺）", body_style))
 
-    story.append(Paragraph("三、资金撤退方向（板块净流出前十）", h2_style))
+    story.append(Spacer(1, 0.4 * cm))
+    story.append(Paragraph("三、资金撤退方向（板块净流出前十）", h1_style))
     if sector_flow and chart_paths.get("sector_outflow"):
         story.append(Image(chart_paths["sector_outflow"], width=15 * cm,
                              height=0.6 * cm * len(sector_flow["outflow"]) + 2 * cm))
@@ -684,14 +815,14 @@ def build_pdf(pdf_path, data, chart_paths):
     story.append(PageBreak())
 
     # ---- 四、龙虎榜机构动作 ----
-    story.append(Paragraph("四、龙虎榜机构动作", h2_style))
+    story.append(Paragraph("四、龙虎榜机构动作", h1_style))
     if lhb_inst:
         if chart_paths.get("lhb_inst_buy"):
-            story.append(Paragraph("机构净买入 TOP10", body_style))
+            story.append(Paragraph("机构净买入 TOP10", h2_style))
             story.append(Image(chart_paths["lhb_inst_buy"], width=15 * cm,
                                  height=0.6 * cm * len(lhb_inst["buy_top"]) + 2 * cm))
         if chart_paths.get("lhb_inst_sell"):
-            story.append(Paragraph("机构净卖出 TOP10", body_style))
+            story.append(Paragraph("机构净卖出 TOP10", h2_style))
             story.append(Image(chart_paths["lhb_inst_sell"], width=15 * cm,
                                  height=0.6 * cm * len(lhb_inst["sell_top"]) + 2 * cm))
     else:
@@ -700,7 +831,7 @@ def build_pdf(pdf_path, data, chart_paths):
     story.append(PageBreak())
 
     # ---- 五、情绪指标 ----
-    story.append(Paragraph("五、情绪指标", h2_style))
+    story.append(Paragraph("五、情绪指标", h1_style))
     mood_bits = []
     if overview.get("zt_count") is not None:
         mood_bits.append(f"涨停家数：{overview['zt_count']}家")
@@ -717,7 +848,7 @@ def build_pdf(pdf_path, data, chart_paths):
     story.append(Spacer(1, 0.5 * cm))
 
     # ---- 六、明日关注 ----
-    story.append(Paragraph("六、明日关注板块", h2_style))
+    story.append(Paragraph("六、明日关注板块", h1_style))
     if watch_sectors:
         table_data = [["板块", "匹配到的实际板块", "今日涨跌幅", "资金净流入", "标签"]]
         for w in watch_sectors:
@@ -732,12 +863,16 @@ def build_pdf(pdf_path, data, chart_paths):
         t.setStyle(TableStyle([
             ("FONTNAME", (0, 0), (-1, -1), "STSong-Light"),
             ("FONTSIZE", (0, 0), (-1, -1), 9.5),
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1a3d7c")),
+            ("BACKGROUND", (0, 0), (-1, 0), PRIMARY),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "STSong-Light"),
+            ("FONTSIZE", (0, 0), (-1, 0), 10),
             ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
             ("ALIGN", (2, 1), (-1, -1), "CENTER"),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f2f2f2")]),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, PRIMARY_LIGHT]),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
         ]))
         story.append(t)
         story.append(Spacer(1, 0.3 * cm))
@@ -752,7 +887,7 @@ def build_pdf(pdf_path, data, chart_paths):
     story.append(PageBreak())
 
     # ---- 附：龙虎榜明细 ----
-    story.append(Paragraph("附：龙虎榜明细（净买入前十）", h2_style))
+    story.append(Paragraph("附：龙虎榜明细（净买入前十）", h1_style))
     if lhb_detail:
         table_data = [["排名", "名称", "代码", "涨跌幅", "净买入", "上榜原因"]]
         for i, item in enumerate(lhb_detail, 1):
@@ -765,83 +900,246 @@ def build_pdf(pdf_path, data, chart_paths):
         t.setStyle(TableStyle([
             ("FONTNAME", (0, 0), (-1, -1), "STSong-Light"),
             ("FONTSIZE", (0, 0), (-1, -1), 8.5),
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1a3d7c")),
+            ("BACKGROUND", (0, 0), (-1, 0), PRIMARY),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "STSong-Light"),
+            ("FONTSIZE", (0, 0), (-1, 0), 9),
             ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f2f2f2")]),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, PRIMARY_LIGHT]),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
         ]))
         story.append(t)
     else:
         story.append(Paragraph("（今日无龙虎榜数据）", body_style))
 
-    story.append(Spacer(1, 1 * cm))
-    story.append(Paragraph(
-        "数据来源：东方财富（经 akshare 抓取），仅供参考，不构成投资建议。",
-        ParagraphStyle("footer", parent=body_style, fontSize=8, textColor=colors.grey),
-    ))
-
-    doc.build(story)
+    # ========== 构建（注入页眉页脚） ==========
+    doc.build(story, onFirstPage=_header_footer, onLaterPages=_header_footer)
 
 
 # ========== 飞书推送 ==========
 
 def send_summary_card(overview, lhb_detail, zt_streak, watch_sectors, pdf_url):
+    """飞书卡片推送（保守稳重版 · 深蓝/灰配色）
+    视觉结构：
+      - header：深蓝底白字标题
+      - column_set：三大指数分卡片（每个独立卡片，左色条）
+      - 一行市场情绪摘要
+      - 模块化分隔（hr + 模块标题）
+      - 底部"查看PDF"按钮
+    """
     if not FEISHU_WEBHOOK_LHB:
         print("未配置 FEISHU_WEBHOOK_LHB，跳过推送")
         return False
 
-    lines = []
-    if overview["indices"]:
-        lines.append("　".join(f"{n} {fmt_pct(c)}" for n, p, c in overview["indices"]))
-    bits = []
+    # ========== 主题色（保守稳重：深蓝主调 + 中性灰） ==========
+    COLOR_HEADER = "blue"            # 飞书内置蓝色模板
+    COLOR_UP_TAG = "green"           # 涨用绿 tag（A股惯例）
+    COLOR_DOWN_TAG = "red"
+    COLOR_NEUTRAL_TAG = "grey"
+
+    # ========== 工具：给数字加颜色 ==========
+    def _color_pct(pct_val):
+        try:
+            v = float(pct_val)
+        except Exception:
+            return "N/A"
+        if v > 0:
+            return f"<font color='green'>**+{v:.2f}%**</font>"
+        if v < 0:
+            return f"<font color='red'>**{v:.2f}%**</font>"
+        return f"{v:.2f}%"
+
+    def _color_amt(v):
+        try:
+            x = float(v)
+        except Exception:
+            return "N/A"
+        if x > 0:
+            return f"<font color='green'>{fmt_amount_yi(x)}</font>"
+        if x < 0:
+            return f"<font color='red'>{fmt_amount_yi(x)}</font>"
+        return fmt_amount_yi(x)
+
+    # ========== 市场一句话总结（规则引擎） ==========
+    def _summarize(ov, zt_stk):
+        zt = ov.get("zt_count")
+        dt = ov.get("dt_count")
+        sh_pct = None
+        for n, _, c in ov.get("indices", []):
+            if n == "上证指数":
+                sh_pct = c
+                break
+
+        # 情绪维度
+        mood = None
+        if zt is not None:
+            if zt >= 50 and (dt is None or dt < 10):
+                mood = "🟢 情绪偏多，市场活跃"
+            elif zt < 20 and dt is not None and dt >= 30:
+                mood = "🔴 情绪偏空，谨慎参与"
+            elif dt is not None:
+                mood = "⚪ 情绪中性，结构性机会"
+
+        # 指数维度
+        trend = None
+        if sh_pct is not None:
+            if sh_pct > 1.0:
+                trend = "📈 上证放量上攻"
+            elif sh_pct < -1.0:
+                trend = "📉 上证明显回调"
+            elif sh_pct > 0.3:
+                trend = "📊 上证小幅走高"
+            elif sh_pct < -0.3:
+                trend = "📊 上证小幅承压"
+
+        bits = [b for b in [trend, mood] if b]
+        return " ｜ ".join(bits) if bits else "（数据不足，暂不评价）"
+
+    # ========== 组装卡片的 elements 列表 ==========
+    elements = []
+
+    # ---- 模块 1：市场一句话总结 ----
+    summary_text = _summarize(overview, zt_streak)
+    elements.append({
+        "tag": "div",
+        "text": {
+            "tag": "lark_md",
+            "content": f"**盘面总览**　{summary_text}",
+        },
+    })
+    elements.append({"tag": "hr"})
+
+    # ---- 模块 2：三大指数（column_set 分卡片） ----
+    indices = overview.get("indices", [])
+    if indices:
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": "**📊 三大指数**"},
+        })
+        col_items = []
+        for name, price, pct in indices:
+            tag_color = COLOR_UP_TAG if pct > 0 else (COLOR_DOWN_TAG if pct < 0 else COLOR_NEUTRAL_TAG)
+            arrow = "▲" if pct > 0 else ("▼" if pct < 0 else "—")
+            col_items.append({
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "elements": [
+                    {"tag": "div", "text": {"tag": "lark_md", "content": f"**{name}**"}},
+                    {"tag": "div", "text": {"tag": "lark_md",
+                        "content": f"<font color='grey'>{price:.2f}</font>"}},
+                    {"tag": "div", "text": {"tag": "lark_md",
+                        "content": f"<font color='{'green' if pct > 0 else 'red' if pct < 0 else 'grey'}'>**{arrow} {pct:+.2f}%**</font>"}},
+                ],
+            })
+        elements.append({"tag": "column_set", "flex_mode": "stretch", "columns": col_items})
+
+    # ---- 模块 3：成交额 / 涨跌停家数 / 连板（横向一行） ----
+    metric_bits = []
     if overview.get("total_amount"):
-        bits.append(f"成交额 {fmt_amount_yi(overview['total_amount'])}元")
+        metric_bits.append(f"**成交额**　{fmt_amount_yi(overview['total_amount'])}元")
     if overview.get("zt_count") is not None:
-        bits.append(f"涨停{overview['zt_count']}家")
+        metric_bits.append(f"**涨停**　<font color='red'>{overview['zt_count']}</font> 家")
     if overview.get("dt_count") is not None:
-        bits.append(f"跌停{overview['dt_count']}家")
-    if bits:
-        lines.append("　".join(bits))
+        metric_bits.append(f"**跌停**　<font color='green'>{overview['dt_count']}</font> 家")
+    if metric_bits:
+        elements.append({"tag": "hr"})
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": "　".join(metric_bits)},
+        })
 
     if zt_streak and zt_streak.get("stocks"):
-        names = "、".join(f"{n}" for n, c in zt_streak["stocks"][:3])
-        lines.append(f"最高连板 {zt_streak['max_streak']}板：{names}")
+        names = "、".join(f"{n}" for n, _ in zt_streak["stocks"][:3])
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md",
+                "content": f"**⚡ 最高连板**　<font color='orange'>{zt_streak['max_streak']}</font> 板 · {names}"},
+        })
 
+    # ---- 模块 4：资金动向（板块流入/流出TOP3） ----
+    sector_flow = None  # 主流程已经把 sector_flow 注入 data，但这里函数签名没接收，我们从 data 全局取
+    # 注：板块资金流数据通过闭包从 main() 传入更干净，这里保持接口稳定只展示其他模块
+    # 如果上层想传 sector_flow，可改签名；本次保守不动签名
+
+    # ---- 模块 5：龙虎榜净买入 TOP3（含涨跌幅） ----
     if lhb_detail:
-        lines.append("")
-        lines.append("**龙虎榜净买入前三：**")
+        elements.append({"tag": "hr"})
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": "**🏆 龙虎榜净买入 TOP3**"},
+        })
+        lhb_lines = []
         for item in lhb_detail[:3]:
-            lines.append(f"· {item['name']}（{item['code']}）净买入 {fmt_amount_yi(item['net_buy'])}元")
+            pct_str = _color_pct(item.get("pct"))
+            amt_str = _color_amt(item.get("net_buy"))
+            lhb_lines.append(
+                f"  {item['name']}（{item['code']}）"
+                f"　净买入 {amt_str}　|　涨幅 {pct_str}"
+            )
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": "\n".join(lhb_lines)},
+        })
 
+    # ---- 模块 6：明日关注（带方向箭头） ----
     if watch_sectors:
-        lines.append("")
-        lines.append("**明日关注：**")
+        elements.append({"tag": "hr"})
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": "**🎯 明日关注**"},
+        })
+        watch_lines = []
         for w in watch_sectors:
-            lines.append(f"{w['tag']} {w['keyword']}（{fmt_pct(w['pct']) if w['pct'] is not None else 'N/A'}）")
+            pct_val = None
+            try:
+                pct_val = float(w["pct"]) if w["pct"] is not None else None
+            except Exception:
+                pass
+            if pct_val is not None:
+                arrow = "▲" if pct_val > 0 else ("▼" if pct_val < 0 else "—")
+                pct_str = f"<font color='{'green' if pct_val > 0 else 'red' if pct_val < 0 else 'grey'}'>{arrow} {pct_val:+.2f}%</font>"
+            else:
+                pct_str = "N/A"
+            tag_legend = {"🔴": "强趋势", "🟡": "观察", "🟢": "风险"}.get(w["tag"], "")
+            watch_lines.append(
+                f"  {w['tag']} **{w['keyword']}**　{pct_str}"
+                + (f"　<font color='grey'>· {tag_legend}</font>" if tag_legend else "")
+            )
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": "\n".join(watch_lines)},
+        })
 
-    content_text = "\n".join(lines) if lines else "今日数据获取不完整，详见PDF报告"
+    # ---- 模块 7：风险提示 + 跳转按钮 ----
+    elements.append({"tag": "hr"})
+    elements.append({
+        "tag": "note",
+        "elements": [{
+            "tag": "plain_text",
+            "content": "数据来源：东方财富（akshare），仅供参考，不构成投资建议。",
+        }],
+    })
+    elements.append({
+        "tag": "action",
+        "actions": [{
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "📄 查看完整PDF报告"},
+            "type": "primary",
+            "url": pdf_url,
+        }],
+    })
 
     card = {
         "msg_type": "interactive",
         "card": {
             "header": {
                 "title": {"tag": "plain_text", "content": f"📊 {TODAY_DISPLAY} 收盘复盘"},
-                "template": "blue",
+                "template": COLOR_HEADER,
             },
-            "elements": [
-                {"tag": "div", "text": {"tag": "lark_md", "content": content_text}},
-                {"tag": "hr"},
-                {
-                    "tag": "action",
-                    "actions": [{
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "📄 查看完整PDF报告"},
-                        "type": "primary",
-                        "url": pdf_url,
-                    }],
-                },
-            ],
+            "elements": elements,
         },
     }
 
@@ -857,7 +1155,136 @@ def send_summary_card(overview, lhb_detail, zt_streak, watch_sectors, pdf_url):
         return False
 
 
+def _fetch_overview_for_date(target_date):
+    """在指定日期抓取指数总览（不影响全局 TODAY）。
+    用临时 monkey-patch 切换 akshare 接口的日期相关入参。
+    """
+    import akshare as _ak
+    global TODAY, TODAY_STR, TODAY_DISPLAY
+    _bak_today, _bak_str, _bak_disp = TODAY, TODAY_STR, TODAY_DISPLAY
+    try:
+        TODAY = target_date
+        TODAY_STR = target_date.strftime("%Y%m%d")
+        TODAY_DISPLAY = target_date.strftime("%Y年%m月%d日")
+        return fetch_index_overview()
+    finally:
+        TODAY, TODAY_STR, TODAY_DISPLAY = _bak_today, _bak_str, _bak_disp
+
+
+def send_preview_card():
+    """盘前 9:00 预览卡片
+    不抓实时数据（盘前还没开盘），只基于：
+      - 昨日收盘状态（fetch_index_overview 可在 TEST_MODE 下回放）
+      - WATCH_KEYWORDS 板块的"昨日标签"作为今日关注点
+    设计目的：开盘前给团队一个简短的"今日盯盘清单"，快速过一遍。
+    """
+    if not FEISHU_WEBHOOK_LHB:
+        print("未配置 FEISHU_WEBHOOK_LHB，跳过盘前推送")
+        return False
+
+    # 盘前取"上一交易日"——找最近的一个有数据的交易日（简单回退1天，可被 TEST_DATE 覆盖）
+    try:
+        prev_day = TODAY - datetime.timedelta(days=1)
+        # 周末处理：周五→周一
+        while prev_day.weekday() >= 5:
+            prev_day -= datetime.timedelta(days=1)
+        prev_str = prev_day.strftime("%Y%m%d")
+    except Exception:
+        prev_str = TODAY_STR
+
+    # 轻量抓昨日数据（沿用主流程函数，但只取必要字段）
+    overview = None
+    try:
+        overview = _fetch_overview_for_date(prev_day)
+    except Exception as ex:
+        print(f"盘前卡片抓取昨日数据失败：{ex}")
+        overview = None
+
+    elements = []
+    elements.append({
+        "tag": "div",
+        "text": {"tag": "lark_md",
+            "content": f"**☀️ 早安**　今天是 **{TODAY_DISPLAY}**（{['周一','周二','周三','周四','周五','周六','周日'][TODAY.weekday()]}）"},
+    })
+    elements.append({"tag": "hr"})
+
+    if overview and overview.get("indices"):
+        # 昨日三大指数
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": "**📊 上一交易日收盘**"},
+        })
+        col_items = []
+        for name, price, pct in overview["indices"]:
+            arrow = "▲" if pct > 0 else ("▼" if pct < 0 else "—")
+            col_items.append({
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "elements": [
+                    {"tag": "div", "text": {"tag": "lark_md", "content": f"**{name}**"}},
+                    {"tag": "div", "text": {"tag": "lark_md",
+                        "content": f"<font color='{'green' if pct > 0 else 'red' if pct < 0 else 'grey'}'>**{arrow} {pct:+.2f}%**</font>"}},
+                ],
+            })
+        elements.append({"tag": "column_set", "flex_mode": "stretch", "columns": col_items})
+
+    # 今日盯盘清单
+    elements.append({"tag": "hr"})
+    elements.append({
+        "tag": "div",
+        "text": {"tag": "lark_md", "content": "**🎯 今日盯盘清单**"},
+    })
+    focus_lines = [f"  • **{kw}**　<font color='grey'>关注开盘资金动向</font>" for kw in WATCH_KEYWORDS]
+    elements.append({
+        "tag": "div",
+        "text": {"tag": "lark_md", "content": "\n".join(focus_lines)},
+    })
+
+    elements.append({"tag": "hr"})
+    elements.append({
+        "tag": "note",
+        "elements": [{
+            "tag": "plain_text",
+            "content": "本卡片由 lhb_push.py 在每个交易日 09:00 自动推送，仅供参考，不构成投资建议。",
+        }],
+    })
+
+    card = {
+        "msg_type": "interactive",
+        "card": {
+            "header": {
+                "title": {"tag": "plain_text", "content": f"☀️ {TODAY_DISPLAY} 盘前预览"},
+                "template": "blue",
+            },
+            "elements": elements,
+        },
+    }
+
+    try:
+        resp = requests.post(FEISHU_WEBHOOK_LHB, json=card, timeout=10)
+        result = resp.json()
+        if result.get("code") not in (0, None):
+            print("盘前推送返回异常：", result)
+            return False
+        print("盘前预览卡片已推送")
+        return True
+    except Exception as ex:
+        print("盘前推送失败：", ex)
+        return False
+
+
 def main():
+    # ========== 模式分发：盘前预览 vs 收盘复盘 ==========
+    RUN_MODE = os.environ.get("RUN_MODE", "fupan").strip().lower()
+    # fupan = 收盘复盘（默认），preview = 盘前预览
+
+    if RUN_MODE == "preview":
+        print(f"===== 盘前预览模式（{TODAY_DISPLAY}） =====")
+        ok = send_preview_card()
+        print("盘前预览" + ("成功" if ok else "失败/跳过"))
+        return
+
     if not IS_TEST_MODE and not is_weekday():
         print("今天是周末，跳过")
         return
