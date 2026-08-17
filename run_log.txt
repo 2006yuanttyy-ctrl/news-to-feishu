@@ -1,2 +1,2 @@
 matplotlib 中文字体使用：Noto Sans CJK SC
-今天是周末，跳过
+今天已经推送过复盘，跳过
