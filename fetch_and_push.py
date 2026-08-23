@@ -1,29 +1,38 @@
 # -*- coding: utf-8 -*-
 """
-自动抓取「财联社电报（重要）」「华尔街见闻实时快讯」「金十数据重要资讯」，
-新内容按类别分组、汇总推送到飞书群机器人。
+盘中财经快讯 → 飞书（V6）
 
-V5 相比 V4 的核心变化：
-1. 不再是抓到一条就发一张卡片 —— 所有来源、所有新条目先收集起来，
-   最后按"战争地缘 / 政策监管 / AI算力 / 半导体 / 商品期货 / 其他"分类分组，
-   一次运行最多只发 1~2 张汇总卡片，避免刷屏、看不过来。
-2. 标题本身就是链接（点标题看详情），不再单独占一行放预览文字和链接，
-   大幅减少每条消息占用的行数和间距。
-3. 只有"战争地缘""政策监管"这两类才 @所有人，其余分类只是分组展示，
-   不再每条都强提醒。
+相对 V5：GitHub Actions 调度；交易日整点+15:30；周日 19:00 热点周报；
+其它时间仅战争/重要政策且热点才推；状态文件固定；Webhook 名与股票项目对齐。
+不读持仓、不 @ 持仓。
 """
+from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
+import sys
 import time
-import requests
-import feedparser
+from datetime import date, datetime, time as dtime, timedelta
 from difflib import SequenceMatcher
+from pathlib import Path
+from zoneinfo import ZoneInfo
 
-# ========== 配置区（一般不用改） ==========
+import feedparser
+import requests
 
-# RSSHub 公共镜像列表：第一个抓不到就依次尝试下一个，提高成功率
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+TZ = ZoneInfo("Asia/Shanghai")
+HERE = Path(__file__).resolve().parent
+# 与 news-to-feishu 仓库现有 workflow 对齐：提交的是 seen.json
+STATE_FILE = HERE / "seen.json"
+
 RSSHUB_MIRRORS = [
     "https://rsshub.app",
     "https://rsshub.rssforever.com",
@@ -32,32 +41,38 @@ RSSHUB_MIRRORS = [
     "https://rsshub.agrreader.com",
 ]
 
-# 各来源的路径（不含域名，域名从上面镜像列表里轮流拼接）
 SOURCES = [
-    # (path, source_key, 来源短标签)
     ("/cls/telegraph/red", "cls_red", "财联社"),
     ("/wallstreetcn/live", "wallstreetcn", "华尔街见闻"),
     ("/jin10/important", "jin10", "金十数据"),
 ]
 
-# 每类消息单次最多考虑几条新的（防止第一次运行或长时间没跑时刷屏）
 MAX_PUSH_PER_SOURCE = 8
-
-# 跨来源去重：如果新消息标题跟"最近一段时间内已经推送过的标题"很相似，
-# 就认为是同一件事被不同来源重复报道，不再重复推送
-DEDUP_SIMILARITY_THRESHOLD = 0.55   # 相似度阈值，0~1，越大越"宽松"
-DEDUP_WINDOW_SECONDS = 3 * 60 * 60  # 只跟最近 3 小时内推送过的标题比较
-
-# 一张卡片最多放几条，超过就拆到下一张卡片
+DEDUP_SIMILARITY_THRESHOLD = 0.55
+DEDUP_WINDOW_SECONDS = 3 * 60 * 60
 MAX_ITEMS_PER_CARD = 20
-# 一次运行最多发几张卡片；超出的条目只在卡片末尾提示条数，不再单独发卡片
 MAX_CARDS_PER_RUN = 2
+SLOT_GRACE_MIN = 12
+SUNDAY_DIGEST_GRACE_MIN = 20
 
-# 已推送记录文件
-SEEN_FILE = "seen.json"
+# 上交所 2026 年已公布休市（含公告中的周末休市日）；再叠加六日判定
+_HOLIDAY_RANGES_2026 = [
+    (date(2026, 1, 1), date(2026, 1, 4)),
+    (date(2026, 2, 14), date(2026, 2, 23)),
+    (date(2026, 2, 28), date(2026, 2, 28)),
+    (date(2026, 4, 4), date(2026, 4, 6)),
+    (date(2026, 5, 1), date(2026, 5, 5)),
+    (date(2026, 5, 9), date(2026, 5, 9)),
+    (date(2026, 6, 19), date(2026, 6, 21)),
+    (date(2026, 9, 20), date(2026, 9, 20)),
+    (date(2026, 9, 25), date(2026, 9, 27)),
+    (date(2026, 10, 1), date(2026, 10, 7)),
+    (date(2026, 10, 10), date(2026, 10, 10)),
+]
 
-# 飞书 Webhook 地址，从 GitHub Secrets 里读取
-FEISHU_WEBHOOK = os.environ.get("FEISHU_WEBHOOK", "").strip()
+HOURLY_SLOTS = [(9, 0), (10, 0), (11, 0), (12, 0), (13, 0), (14, 0), (15, 0)]
+CLOSE_SLOT = (15, 30)
+WEEKEND_DIGEST = (19, 0)
 
 HEADERS = {
     "User-Agent": (
@@ -67,8 +82,6 @@ HEADERS = {
     "Accept": "application/rss+xml, application/xml, text/xml, */*",
 }
 
-# ========== 分类关键词（按优先级从高到低，命中第一个匹配的类别就归为该类） ==========
-# 每一项：(分类key, 展示用的分类标签, 关键词列表)
 CATEGORY_DEFS = [
     ("war", "🟡 战争地缘", [
         "战争", "军事", "袭击", "空袭", "导弹", "无人机", "轰炸", "核武", "核设施",
@@ -77,13 +90,15 @@ CATEGORY_DEFS = [
         "中东局势", "国防部", "国防军", "参谋长", "革命卫队", "航母", "驱逐舰",
         "战机", "F35", "F-35", "B2", "B-2", "爱国者", "萨德", "红海",
         "霍尔木兹", "波斯湾", "军火", "武器援助", "撤侨", "戒严", "紧急状态",
+        "开战",
     ]),
     ("policy", "🟥 政策监管", [
         "国务院", "国常会", "证监会", "央行", "金融监管总局", "制裁",
         "降准", "降息", "货币政策", "财政政策", "专项债", "政治局会议",
+        "中央政治局",
     ]),
     ("ai", "🟢 AI算力机器人", [
-        "人工智能", "AI", "大模型", "算力", "AIGC", "机器人", "人形机器人",
+        "人工智能", "大模型", "算力", "AIGC", "人形机器人",
         "智谱", "DeepSeek", "OpenAI", "英伟达", "GPU", "数据中心", "CPO",
     ]),
     ("semiconductor", "🟣 半导体芯片", [
@@ -92,23 +107,14 @@ CATEGORY_DEFS = [
     ]),
     ("commodity", "🔵 商品期货贵金属", [
         "黄金", "白银", "现货黄金", "现货白银", "COMEX黄金", "COMEX白银",
-        "伦敦金", "伦敦银", "贵金属", "有色金属", "铜", "沪铜", "伦铜",
-        "铝", "氧化铝", "锌", "铅", "镍", "锡", "工业硅", "稀土",
-        "碳酸锂", "锂矿", "锂盐", "锂电原料", "铁矿石",
-        "焦煤", "焦炭", "原油", "布伦特原油", "WTI原油",
-        "天然气", "LNG", "期货", "商品期货",
+        "伦敦金", "伦敦银", "贵金属", "有色金属", "沪铜", "伦铜",
+        "氧化铝", "工业硅", "稀土", "碳酸锂", "锂矿", "锂盐",
+        "铁矿石", "焦煤", "焦炭", "布伦特原油", "WTI原油", "LNG",
     ]),
 ]
-# 兜底分类：没命中任何关键词的消息
 DEFAULT_CATEGORY = ("other", "⚪ 其他财经快讯")
-
-# 分类展示顺序（优先级从高到低）
 CATEGORY_ORDER = [k for k, _, _ in CATEGORY_DEFS] + [DEFAULT_CATEGORY[0]]
-
-# 需要 @所有人 强提醒的分类
 ALERT_CATEGORIES = {"war", "policy"}
-
-# 每个分类对应的卡片主题色（Feishu card template 颜色）
 CATEGORY_COLOR = {
     "war": "yellow",
     "policy": "red",
@@ -118,9 +124,43 @@ CATEGORY_COLOR = {
     "other": "grey",
 }
 
+HOT_TITLE_KWS = ["重磅", "突发", "紧急", "重大", "开战", "停火"]
+IMPORTANT_POLICY_KWS = [
+    "国务院", "国常会", "证监会", "央行", "金融监管总局", "制裁",
+    "降准", "降息", "政治局",
+]
+HOT_SOURCES = {"cls_red", "jin10"}
 
-def categorize(title, summary=""):
-    """返回 (分类key, 分类展示标签)，按 CATEGORY_DEFS 顺序，命中第一个就返回"""
+POSITIVE = ["突破", "增长", "扩大", "签约", "利好", "创新高", "上调", "增持"]
+NEGATIVE = ["下滑", "制裁", "下调", "减持", "亏损", "调查", "处罚"]
+
+
+def now_bj() -> datetime:
+    return datetime.now(TZ)
+
+
+def webhook_url() -> str:
+    return (
+        os.environ.get("FEISHU_WEBHOOK_URL")
+        or os.environ.get("FEISHU_WEBHOOK")
+        or ""
+    ).strip()
+
+
+def in_holiday_2026(d: date) -> bool:
+    for a, b in _HOLIDAY_RANGES_2026:
+        if a <= d <= b:
+            return True
+    return False
+
+
+def is_trading_day(d: date) -> bool:
+    if d.weekday() >= 5:
+        return False
+    return not in_holiday_2026(d)
+
+
+def categorize(title: str, summary: str = "") -> tuple[str, str]:
     text = f"{title} {summary}".lower()
     for key, label, kws in CATEGORY_DEFS:
         if any(kw.lower() in text for kw in kws):
@@ -128,13 +168,10 @@ def categorize(title, summary=""):
     return DEFAULT_CATEGORY
 
 
-def sentiment_hint(title, summary=""):
-    """粗略判断这条消息偏利好/利空/中性，用于在条目后面加个小标签"""
+def sentiment_hint(title: str, summary: str = "") -> str:
     text = f"{title} {summary}"
-    positive = ["突破", "增长", "扩大", "签约", "利好", "创新高", "上调", "增持"]
-    negative = ["下滑", "制裁", "下调", "减持", "亏损", "调查", "处罚"]
-    p = sum(1 for x in positive if x in text)
-    n = sum(1 for x in negative if x in text)
+    p = sum(1 for x in POSITIVE if x in text)
+    n = sum(1 for x in NEGATIVE if x in text)
     if p > n:
         return "利好"
     if n > p:
@@ -142,8 +179,39 @@ def sentiment_hint(title, summary=""):
     return "中性"
 
 
-def normalize_title(title):
-    """把标题里的日期、时间、来源名等"干扰项"去掉，方便比较是不是同一件事"""
+def is_important_policy(title: str, summary: str = "") -> bool:
+    text = f"{title} {summary}"
+    return any(kw in text for kw in IMPORTANT_POLICY_KWS)
+
+
+def is_hot(item: dict) -> bool:
+    if item.get("source_key") in HOT_SOURCES:
+        return True
+    text = f"{item.get('title', '')} {item.get('summary', '')}"
+    if any(kw in text for kw in HOT_TITLE_KWS):
+        return True
+    if item.get("cat_key") == "war":
+        return True
+    if item.get("cat_key") == "policy" and is_important_policy(
+        item.get("title", ""), item.get("summary", "")
+    ):
+        return True
+    return False
+
+
+def is_breaking(item: dict) -> bool:
+    if not is_hot(item):
+        return False
+    if item.get("cat_key") == "war":
+        return True
+    if item.get("cat_key") == "policy" and is_important_policy(
+        item.get("title", ""), item.get("summary", "")
+    ):
+        return True
+    return False
+
+
+def normalize_title(title: str) -> str:
     t = title.strip()
     t = re.sub(r"^[\d]{1,2}[月/-][\d]{1,2}[日]?[，,：:\s]*", "", t)
     t = re.sub(r"^[\d]{1,2}[:：][\d]{1,2}[，,：:\s]*", "", t)
@@ -152,8 +220,7 @@ def normalize_title(title):
     return t
 
 
-def is_duplicate_across_sources(title, recent_titles):
-    """判断这条标题，是不是跟"最近推送过的标题"讲的是同一件事"""
+def is_duplicate_across_sources(title: str, recent_titles: list) -> bool:
     norm = normalize_title(title)
     if not norm:
         return False
@@ -167,37 +234,34 @@ def is_duplicate_across_sources(title, recent_titles):
         short, long_ = (norm, other) if len(norm) <= len(other) else (other, norm)
         if len(short) >= 8 and short in long_:
             return True
-        ratio = SequenceMatcher(None, norm, other).ratio()
-        if ratio >= DEDUP_SIMILARITY_THRESHOLD:
+        if SequenceMatcher(None, norm, other).ratio() >= DEDUP_SIMILARITY_THRESHOLD:
             return True
     return False
 
 
-def load_seen():
-    if os.path.exists(SEEN_FILE):
-        with open(SEEN_FILE, "r", encoding="utf-8") as f:
-            try:
-                return json.load(f)
-            except json.JSONDecodeError:
-                return {}
-    return {}
+def load_state() -> dict:
+    if not STATE_FILE.exists():
+        return {}
+    raw = STATE_FILE.read_text(encoding="utf-8-sig")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
-def save_seen(seen):
-    with open(SEEN_FILE, "w", encoding="utf-8") as f:
-        json.dump(seen, f, ensure_ascii=False, indent=2)
+def save_state(state: dict) -> None:
+    text = json.dumps(state, ensure_ascii=False, indent=2)
+    STATE_FILE.write_text(text + "\n", encoding="utf-8")
 
 
-def fetch_entries(path):
-    """依次尝试各个 RSSHub 镜像抓取 path 对应的 RSS，
-    返回 [(id, title, summary, link, published_ts), ...]，按时间从旧到新排列。
-    """
+def fetch_entries(path: str) -> list:
     last_error = None
     for base in RSSHUB_MIRRORS:
         url = base.rstrip("/") + path
         try:
             resp = requests.get(url, headers=HEADERS, timeout=15)
-            print(f"  尝试镜像 {base} → HTTP {resp.status_code}，返回长度 {len(resp.text)}")
+            print(f"  尝试镜像 {base} → HTTP {resp.status_code}，长度 {len(resp.text)}")
             if resp.status_code != 200 or len(resp.text) < 100:
                 last_error = f"HTTP {resp.status_code}"
                 continue
@@ -205,120 +269,114 @@ def fetch_entries(path):
             if not feed.entries:
                 last_error = "解析出 0 条 entries"
                 continue
-
             entries = []
             for e in feed.entries:
                 entry_id = e.get("id") or e.get("link") or e.get("title")
-                title = e.get("title", "").strip()
-                link = e.get("link", "")
-                summary = (e.get("summary", "") or e.get("description", "") or "")
+                title = (e.get("title") or "").strip()
+                link = e.get("link") or ""
+                summary = (e.get("summary") or e.get("description") or "")
                 summary = re.sub(r"<[^>]+>", "", summary).strip()
                 t = e.get("published_parsed") or e.get("updated_parsed")
                 ts = time.mktime(t) if t else time.time()
                 entries.append((entry_id, title, summary, link, ts))
             entries.sort(key=lambda x: x[4])
-            print(f"  ✔ 从 {base} 成功抓到 {len(entries)} 条")
+            print(f"  从 {base} 抓到 {len(entries)} 条")
             return entries
         except Exception as ex:
             last_error = str(ex)
-            print(f"  镜像 {base} 抓取出错：{ex}")
+            print(f"  镜像 {base} 出错：{ex}")
+    raise RuntimeError(f"所有镜像失败：{last_error}")
+
+
+def item_from_entry(source_key: str, source_label: str, entry: tuple) -> dict:
+    entry_id, title, summary, link, ts = entry
+    cat_key, cat_label = categorize(title, summary)
+    return {
+        "id": entry_id,
+        "cat_key": cat_key,
+        "cat_label": cat_label,
+        "title": title,
+        "summary": summary,
+        "link": link,
+        "source": source_label,
+        "source_key": source_key,
+        "sentiment": sentiment_hint(title, summary),
+        "ts": ts,
+    }
+
+
+def collect_new(state: dict, *, seed_only: bool) -> list[dict]:
+    collected: list[dict] = []
+    for path, source_key, source_label in SOURCES:
+        print(f"开始抓取：{source_label}")
+        try:
+            entries = fetch_entries(path)
+        except Exception as ex:
+            print(f"抓取 {source_label} 失败：{ex}")
             continue
 
-    raise RuntimeError(f"所有镜像均抓取失败，最后一次错误：{last_error}")
+        seen_ids = set(state.get(source_key, []))
+        recent_titles = state.setdefault("_recent_titles", [])
+        new_entries = [e for e in entries if e[0] not in seen_ids]
+        for entry_id, *_ in new_entries:
+            seen_ids.add(entry_id)
+        to_consider = new_entries[-MAX_PUSH_PER_SOURCE:] if new_entries else []
+
+        if seed_only:
+            for entry_id, title, summary, link, ts in to_consider:
+                recent_titles.append({
+                    "norm": normalize_title(title),
+                    "ts": time.time(),
+                    "source": source_key,
+                })
+            print(f"{source_label} 首次/种子：记录 {len(new_entries)} 条，不入待发")
+        else:
+            skipped = 0
+            for entry in to_consider:
+                entry_id, title, summary, link, ts = entry
+                if is_duplicate_across_sources(title, recent_titles):
+                    skipped += 1
+                    print(f"  跳过重复：{title}")
+                    continue
+                collected.append(item_from_entry(source_key, source_label, entry))
+                recent_titles.append({
+                    "norm": normalize_title(title),
+                    "ts": time.time(),
+                    "source": source_key,
+                })
+            print(f"{source_label}：待处理 {len(to_consider) - skipped}，重复 {skipped}")
+
+        state[source_key] = list(seen_ids)[-500:]
+        now = time.time()
+        state["_recent_titles"] = [
+            x for x in recent_titles if now - x.get("ts", 0) <= DEDUP_WINDOW_SECONDS
+        ][-300:]
+    return collected
 
 
-def process_source(path, source_key, source_label, seen, collected):
-    """抓取一个来源，把去重后需要推送的条目追加进 collected 列表（不在这里发送）"""
-    print(f"开始抓取：{source_label}")
-    try:
-        entries = fetch_entries(path)
-    except Exception as ex:
-        print(f"抓取 {source_label} 失败：{ex}")
-        return
-
-    seen_ids = set(seen.get(source_key, []))
-    recent_titles = seen.setdefault("_recent_titles", [])
-
-    new_entries = [e for e in entries if e[0] not in seen_ids]
-    first_run = len(seen_ids) == 0
-
-    for entry_id, *_ in new_entries:
-        seen_ids.add(entry_id)
-
-    to_consider = new_entries[-MAX_PUSH_PER_SOURCE:] if new_entries else []
-
-    if first_run:
-        # 首次运行：只记录历史标题作为去重起点，不推送，避免刚上线就刷屏
-        for entry_id, title, summary, link, ts in to_consider:
-            recent_titles.append({
-                "norm": normalize_title(title),
-                "ts": time.time(),
-                "source": source_key,
-            })
-        print(f"{source_label} 首次运行，记录 {len(new_entries)} 条历史消息，不推送")
-    else:
-        skipped_dup = 0
-        for entry_id, title, summary, link, ts in to_consider:
-            if is_duplicate_across_sources(title, recent_titles):
-                skipped_dup += 1
-                print(f"  跳过（跟其他来源重复）：{title}")
-                continue
-            cat_key, cat_label = categorize(title, summary)
-            collected.append({
-                "cat_key": cat_key,
-                "cat_label": cat_label,
-                "title": title,
-                "link": link,
-                "source": source_label,
-                "sentiment": sentiment_hint(title, summary),
-                "ts": ts,
-            })
-            recent_titles.append({
-                "norm": normalize_title(title),
-                "ts": time.time(),
-                "source": source_key,
-            })
-        print(f"{source_label}：本次收集 {len(to_consider) - skipped_dup} 条待推送，因跨源重复跳过 {skipped_dup} 条")
-
-    seen[source_key] = list(seen_ids)[-500:]
-    now = time.time()
-    seen["_recent_titles"] = [
-        item for item in recent_titles if now - item.get("ts", 0) <= DEDUP_WINDOW_SECONDS
-    ][-300:]
-
-
-def build_card_bodies(collected):
-    """
-    把 collected 按分类分组，生成若干张卡片的内容：
-    每张卡片是 (markdown正文, 是否需要@所有人, 主题色) 的元组列表。
-    最多生成 MAX_CARDS_PER_RUN 张，多出的条目在最后一张卡片末尾提示条数。
-    """
+def build_card_bodies(collected: list[dict]) -> list[tuple[str, bool, str]]:
     if not collected:
         return []
-
-    groups = {}
+    groups: dict[str, list] = {}
     for item in collected:
         groups.setdefault(item["cat_key"], []).append(item)
     for items in groups.values():
         items.sort(key=lambda x: x["ts"])
 
-    # 按分类优先级，把所有条目拉平成一个"分组块"列表：[(cat_key, cat_label, [items...]), ...]
     blocks = []
     for key in CATEGORY_ORDER:
         items = groups.get(key)
         if items:
-            label = items[0]["cat_label"]
-            blocks.append((key, label, items))
+            blocks.append((key, items[0]["cat_label"], items))
 
     total_items = sum(len(items) for _, _, items in blocks)
-
-    cards = []
-    current_lines = []
+    cards: list[tuple[str, bool, str]] = []
+    current_lines: list[str] = []
     current_count = 0
     current_alert = False
-    current_colors = set()
+    current_colors: set[str] = set()
 
-    def flush_card():
+    def flush_card() -> None:
         nonlocal current_lines, current_count, current_alert, current_colors
         if current_lines:
             color = "red" if current_alert else (
@@ -329,13 +387,11 @@ def build_card_bodies(collected):
 
     for key, label, items in blocks:
         if len(cards) >= MAX_CARDS_PER_RUN - 1 and current_count >= MAX_ITEMS_PER_CARD:
-            break  # 最后一张卡片也满了，剩下的条目直接跳过，只在末尾提示条数
-
+            break
         if current_count + len(items) > MAX_ITEMS_PER_CARD and current_lines:
             flush_card()
             if len(cards) >= MAX_CARDS_PER_RUN:
                 break
-
         current_lines.append(f"**{label}**（{len(items)}条）")
         for i, it in enumerate(items, 1):
             tag = f" · {it['sentiment']}" if it["sentiment"] != "中性" else ""
@@ -349,69 +405,183 @@ def build_card_bodies(collected):
         current_colors.add(CATEGORY_COLOR.get(key, "blue"))
 
     flush_card()
-
-    shown = sum(1 for _ in cards) and sum(
-        len([l for l in c[0].split("\n") if re.match(r"^\d+\.", l)]) for c in cards
+    shown = sum(
+        len([ln for ln in c[0].split("\n") if re.match(r"^\d+\.", ln)]) for c in cards
     )
     if shown < total_items and cards:
         text, alert, color = cards[-1]
         remaining = total_items - shown
-        text += f"\n\n_另有 {remaining} 条较次要资讯，可稍后在财联社 / 华尔街见闻客户端查看_"
+        text += f"\n\n_另有 {remaining} 条较次要资讯，可稍后在财联社 / 华尔街见闻查看_"
         cards[-1] = (text, alert, color)
-
     return cards[:MAX_CARDS_PER_RUN]
 
 
-def send_card(text, alert, color, page_info=""):
-    if not FEISHU_WEBHOOK:
-        print("未配置 FEISHU_WEBHOOK，跳过推送，仅打印：")
+def send_card(text: str, alert: bool, color: str, title: str) -> None:
+    hook = webhook_url()
+    if not hook:
+        print("未配置 FEISHU_WEBHOOK_URL，跳过推送，仅打印：")
         print(text)
         return
-
-    title = "📊 财经快讯速览" + (f" {page_info}" if page_info else "")
     elements = [{"tag": "div", "text": {"tag": "lark_md", "content": text}}]
     if alert:
         elements.append({"tag": "div", "text": {"tag": "lark_md", "content": "<at id=all></at>"}})
-
     payload = {
         "msg_type": "interactive",
         "card": {
-            "header": {
-                "title": {"tag": "plain_text", "content": title},
-                "template": color,
-            },
+            "header": {"title": {"tag": "plain_text", "content": title}, "template": color},
             "elements": elements,
         },
     }
-
     try:
-        resp = requests.post(FEISHU_WEBHOOK, json=payload, timeout=10)
+        resp = requests.post(hook, json=payload, timeout=10)
         result = resp.json()
         if result.get("code") not in (0, None):
             print("飞书推送返回异常：", result)
+        else:
+            print("飞书推送成功")
     except Exception as ex:
         print("推送失败：", ex)
     time.sleep(0.3)
 
 
-def main():
-    seen = load_seen()
-    collected = []
+def minutes_since(dt: datetime, hh: int, mm: int) -> float:
+    slot = dt.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    return (dt - slot).total_seconds() / 60.0
 
-    for path, source_key, source_label in SOURCES:
-        process_source(path, source_key, source_label, seen, collected)
 
-    cards = build_card_bodies(collected)
-    total_cards = len(cards)
+def detect_mode(now: datetime, slots_done: list[str], force_test: bool) -> tuple[str, str]:
+    """返回 (mode, slot_id)。mode: test / trading / weekend / breaking / quiet"""
+    if force_test:
+        return "test", f"test-{now.strftime('%Y-%m-%dT%H%M')}"
+
+    d = now.date()
+    trading = is_trading_day(d)
+
+    if trading:
+        for hh, mm in HOURLY_SLOTS + [CLOSE_SLOT]:
+            elapsed = minutes_since(now, hh, mm)
+            if 0 <= elapsed <= SLOT_GRACE_MIN:
+                slot_id = f"{d.isoformat()}T{hh:02d}:{mm:02d}"
+                if slot_id in slots_done:
+                    return "breaking", slot_id
+                return "trading", slot_id
+
+    if (not trading) and now.weekday() == 6:
+        elapsed = minutes_since(now, WEEKEND_DIGEST[0], WEEKEND_DIGEST[1])
+        if 0 <= elapsed <= SUNDAY_DIGEST_GRACE_MIN:
+            slot_id = f"{d.isoformat()}T19:00"
+            if slot_id in slots_done:
+                return "breaking", slot_id
+            return "weekend", slot_id
+
+    return "breaking", ""
+
+
+def weekend_window_start(now: datetime) -> float:
+    d = now.date()
+    # 本周日 19:00 回顾：从本周六 00:00 起
+    saturday = d - timedelta(days=(d.weekday() - 5) % 7)
+    if d.weekday() == 6:
+        saturday = d - timedelta(days=1)
+    start = datetime.combine(saturday, dtime(0, 0), TZ)
+    return start.timestamp()
+
+
+def merge_pending(state: dict, new_items: list[dict]) -> list[dict]:
+    pending = state.get("_pending") or []
+    by_id = {it.get("id"): it for it in pending if it.get("id")}
+    for it in new_items:
+        by_id[it["id"]] = it
+    return list(by_id.values())
+
+
+def push_items(items: list[dict], title: str) -> None:
+    cards = build_card_bodies(items)
+    total = len(cards)
     for idx, (text, alert, color) in enumerate(cards, 1):
-        page_info = f"({idx}/{total_cards})" if total_cards > 1 else ""
-        send_card(text, alert, color, page_info)
-
+        page = f" ({idx}/{total})" if total > 1 else ""
+        send_card(text, alert, color, title + page)
     if not cards:
-        print("本次没有需要推送的新消息")
+        print("没有可推送条目")
 
-    save_seen(seen)
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="盘中财经快讯 V6")
+    p.add_argument("--test", action="store_true", help="忽略时段，强制推一张样卡")
+    p.add_argument("--dry-run", action="store_true", help="抓取分类但不写状态、不推飞书")
+    return p.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    now = now_bj()
+    print(f"北京时间 {now.strftime('%Y-%m-%d %H:%M:%S')} 交易日={is_trading_day(now.date())}")
+
+    state = load_state()
+    has_history = any(state.get(k) for k, _, _ in SOURCES)
+    slots_done = list(state.get("_slots_done") or [])
+    mode, slot_id = detect_mode(now, slots_done, args.test)
+    print(f"模式={mode} 槽={slot_id or '-'}")
+
+    seed_only = (not has_history) and (not args.test)
+    new_items = collect_new(state, seed_only=seed_only)
+
+    if args.dry_run:
+        print(f"dry-run：新条目 {len(new_items)}，不写盘不推送")
+        for it in new_items:
+            print(f"  [{it['cat_label']}] {it['title']} hot={is_hot(it)} brk={is_breaking(it)}")
+        return 0
+
+    if seed_only:
+        state["_pending"] = []
+        save_state(state)
+        print("首次运行只记历史，不推送")
+        return 0
+
+    pending = merge_pending(state, new_items)
+
+    if mode == "test":
+        batch = pending[-MAX_ITEMS_PER_CARD:] if pending else new_items
+        push_items(batch, "📊 财经快讯试推")
+        state["_pending"] = []
+        if slot_id:
+            slots_done.append(slot_id)
+        state["_slots_done"] = slots_done[-40:]
+        save_state(state)
+        return 0
+
+    if mode == "trading":
+        push_items(pending, "📊 财经快讯速览")
+        state["_pending"] = []
+        slots_done.append(slot_id)
+        state["_slots_done"] = slots_done[-40:]
+        save_state(state)
+        return 0
+
+    if mode == "weekend":
+        start_ts = weekend_window_start(now)
+        batch = [it for it in pending if is_hot(it) and it.get("ts", 0) >= start_ts]
+        batch_ids = {it.get("id") for it in batch}
+        leftover = [it for it in pending if it.get("id") not in batch_ids]
+        push_items(batch, "📊 周末热点速览")
+        state["_pending"] = leftover
+        slots_done.append(slot_id)
+        state["_slots_done"] = slots_done[-40:]
+        save_state(state)
+        return 0
+
+    # breaking / quiet：仅战争/重要政策热点立刻推，其余进待发
+    breaking = [it for it in pending if is_breaking(it)]
+    rest = [it for it in pending if not is_breaking(it)]
+    if breaking:
+        push_items(breaking, "🚨 热点快讯")
+        state["_pending"] = rest
+    else:
+        state["_pending"] = pending
+        print("非推送窗口，无战争/重要政策热点，已写入待发")
+    save_state(state)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
